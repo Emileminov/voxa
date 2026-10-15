@@ -685,6 +685,7 @@ struct SettingsView: View {
     var body: some View {
         ScrollView(.vertical, showsIndicators: true) {
         VStack(alignment: .leading, spacing: 18) {
+            Toggle("Отправлять сразу: нажимать Enter после вставки текста", isOn: $prefs.autoSend).font(.headline)
             Text("Вид анимации").font(.headline)
             HStack(spacing: 14) { ForEach(0..<4, id: \.self) { card($0) } }
             HStack(spacing: 12) {
@@ -751,7 +752,6 @@ struct SettingsView: View {
             .onReceive(Timer.publish(every: 1, on: .main, in: .common).autoconnect()) { _ in
                 permState = Perm.allCases.map { $0.granted }
             }
-            Toggle("Отправлять сразу: нажимать Enter после вставки текста", isOn: $prefs.autoSend)
             Toggle("Запускать при входе в систему", isOn: Binding(
                 get: { launchAtLogin },
                 set: { v in
@@ -817,6 +817,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
             DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in
                 guard let w = self?.settingsWindow, let host = w.contentView as? NSHostingView<SettingsView> else { exit(1) }
                 print("window content:", w.contentView!.frame.size, "window frame:", w.frame.size, "screen:", NSScreen.main!.visibleFrame.size)
+                if let path = env0["VOXA_WINDOWTEST"], path.hasPrefix("/"), let v = w.contentView {
+                    let rep = v.bitmapImageRepForCachingDisplay(in: v.bounds)!
+                    v.cacheDisplay(in: v.bounds, to: rep)
+                    try? rep.representation(using: .png, properties: [:])?.write(to: URL(fileURLWithPath: path))
+                }
                 exit(0)
             }
             return
@@ -846,7 +851,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
         }
         if let path = env0["VOXA_SETTINGS_SHOT"] {
             DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
-                let r = ImageRenderer(content: SettingsView().frame(width: 710, height: 720).background(Color(white: 0.16)).environment(\.colorScheme, .dark))
+                let r = ImageRenderer(content: SettingsView().frame(width: 710, height: 720).background(Color(white: (env0["VOXA_LIGHT"] != nil ? 0.95 : 0.16))).environment(\.colorScheme, env0["VOXA_LIGHT"] != nil ? .light : .dark))
                 r.scale = 2
                 if let t = r.nsImage?.tiffRepresentation, let png = NSBitmapImageRep(data: t)?.representation(using: .png, properties: [:]) { try? png.write(to: URL(fileURLWithPath: path)) }
                 exit(0)
