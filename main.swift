@@ -132,6 +132,40 @@ enum Whisper {
 extension Notification.Name { static let prefsChanged = Notification.Name("prefsChanged") }
 let panelW: CGFloat = 720, panelH: CGFloat = 340
 
+// MARK: - Permissions
+
+enum Perm: Int, CaseIterable {
+    case mic, access, input
+    var title: String { ["Микрофон", "Универсальный доступ", "Мониторинг ввода"][rawValue] }
+    var why: String { ["чтобы слышать твой голос", "чтобы вставлять текст", "чтобы ловить правый ⌥"][rawValue] }
+    var granted: Bool {
+        switch self {
+        case .mic: return AVCaptureDevice.authorizationStatus(for: .audio) == .authorized
+        case .access: return AXIsProcessTrusted()
+        case .input: return CGPreflightListenEventAccess()
+        }
+    }
+    func request() {
+        func pane(_ n: String) {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) {
+                NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.preference.security?\(n)")!)
+            }
+        }
+        switch self {
+        case .mic:
+            if AVCaptureDevice.authorizationStatus(for: .audio) == .notDetermined { AVCaptureDevice.requestAccess(for: .audio) { _ in } }
+            else { pane("Privacy_Microphone") }
+        case .access:
+            _ = AXIsProcessTrustedWithOptions([kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary)
+            pane("Privacy_Accessibility")
+        case .input:
+            _ = CGRequestListenEventAccess()
+            pane("Privacy_ListenEvent")
+        }
+    }
+    static var allGranted: Bool { allCases.allSatisfy { $0.granted } }
+}
+
 // MARK: - Prefs
 
 final class Prefs: ObservableObject {
@@ -466,6 +500,7 @@ struct SettingsView: View {
     @ObservedObject var prefs = Prefs.shared
     @StateObject var demo = Demo()
     @AppStorage("lang") var lang = "auto"
+    @State var permState: [Bool] = Perm.allCases.map { $0.granted }
     @State var launchAtLogin = SMAppService.mainApp.status == .enabled
 
     var positionGrid: some View {
@@ -535,6 +570,22 @@ struct SettingsView: View {
                     Text("Авто").tag("auto"); Text("Русский").tag("ru"); Text("English").tag("en")
                 }.pickerStyle(.segmented).labelsHidden()
             }
+            VStack(alignment: .leading, spacing: 8) {
+                Text("Разрешения").font(.headline)
+                ForEach(Perm.allCases, id: \.rawValue) { p in
+                    HStack(spacing: 10) {
+                        Image(systemName: permState[p.rawValue] ? "checkmark.circle.fill" : "exclamationmark.circle.fill")
+                            .foregroundColor(permState[p.rawValue] ? .green : .orange)
+                        Text("\(p.rawValue + 1). \(p.title)").frame(width: 190, alignment: .leading)
+                        Text(p.why).foregroundColor(.secondary)
+                        Spacer()
+                        if !permState[p.rawValue] { Button("Выдать") { p.request() } }
+                    }
+                }
+            }
+            .onReceive(Timer.publish(every: 1, on: .main, in: .common).autoconnect()) { _ in
+                permState = Perm.allCases.map { $0.granted }
+            }
             Toggle("Запускать при входе в систему", isOn: Binding(
                 get: { launchAtLogin },
                 set: { v in
@@ -572,7 +623,7 @@ final class Downloader: NSObject, URLSessionDownloadDelegate {
 
 // MARK: - App
 
-final class AppDelegate: NSObject, NSApplicationDelegate {
+final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     let model = Model()
     let recorder = Recorder()
     var panel: NSPanel!
@@ -588,9 +639,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ n: Notification) {
         setupPanel()
         setupMenu()
-        AVCaptureDevice.requestAccess(for: .audio) { _ in }
-        let opts = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary
-        _ = AXIsProcessTrustedWithOptions(opts)
 
         NotificationCenter.default.addObserver(forName: .prefsChanged, object: nil, queue: .main) { [weak self] _ in self?.showPreview() }
         Whisper.migrateOldDir()
@@ -621,8 +669,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if Whisper.model == nil { downloadModel() }
 
         // Hold Right Option to talk
-        NSEvent.addGlobalMonitorForEvents(matching: .flagsChanged) { [weak self] e in self?.flags(e) }
         NSEvent.addLocalMonitorForEvents(matching: .flagsChanged) { [weak self] e in self?.flags(e); return e }
+        installGlobalMonitor()
+        // ждём выдачи прав: глобальный монитор нужно ставить заново, когда «Мониторинг ввода» включили
+        Timer.scheduledTimer(withTimeInterval: 1.5, repeats: true) { [weak self] _ in
+            guard let self = self else { return }
+            if Perm.input.granted && !self.monitorWithAccess { self.installGlobalMonitor() }
+        }
+        if !Perm.allGranted {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in self?.statusItem.button?.performClick(nil) }
+        }
 
         Timer.scheduledTimer(withTimeInterval: 1 / 30, repeats: true) { [weak self] _ in
             guard let self = self, self.model.phase == .recording else { return }
@@ -641,6 +697,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     var viaMenu = false
+    var globalMonitor: Any?
+    var monitorWithAccess = false
+    var permItems: [NSMenuItem] = []
+
+    func installGlobalMonitor() {
+        if let m = globalMonitor { NSEvent.removeMonitor(m) }
+        globalMonitor = NSEvent.addGlobalMonitorForEvents(matching: .flagsChanged) { [weak self] e in self?.flags(e) }
+        monitorWithAccess = Perm.input.granted
+    }
     var previewing = false
     var previewTimer: Timer?
     var previewWork: DispatchWorkItem?
@@ -777,13 +842,35 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(hint)
         menu.addItem(NSMenuItem(title: recording ? "Остановить запись" : "Начать запись", action: #selector(toggle), keyEquivalent: ""))
         menu.addItem(.separator())
+        let head = NSMenuItem(title: "Разрешения (по порядку):", action: nil, keyEquivalent: "")
+        head.isEnabled = false
+        menu.addItem(head)
+        permItems = Perm.allCases.map { p in
+            let it = NSMenuItem(title: "", action: #selector(grantPerm(_:)), keyEquivalent: "")
+            it.tag = p.rawValue
+            menu.addItem(it)
+            return it
+        }
+        refreshPermItems()
         menu.addItem(.separator())
         menu.addItem(NSMenuItem(title: "Настройки…", action: #selector(openSettings), keyEquivalent: ","))
         menu.addItem(.separator())
         menu.addItem(NSMenuItem(title: "Выйти", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
         menu.items.forEach { $0.target = $0.action == #selector(NSApplication.terminate(_:)) ? NSApp : self }
+        menu.delegate = self
         statusItem.menu = menu
     }
+
+    func refreshPermItems() {
+        for it in permItems {
+            guard let p = Perm(rawValue: it.tag) else { continue }
+            it.title = "\(p.rawValue + 1). \(p.title) — \(p.granted ? "✓ выдано" : "выдать… (\(p.why))")"
+        }
+    }
+
+    func menuWillOpen(_ menu: NSMenu) { refreshPermItems() }
+
+    @objc func grantPerm(_ s: NSMenuItem) { Perm(rawValue: s.tag)?.request() }
 
     var settingsWindow: NSWindow?
     @objc func openSettings() {
