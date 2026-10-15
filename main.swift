@@ -68,6 +68,7 @@ enum Whisper {
         return ([bundled].compactMap { $0 } + ["/opt/homebrew/bin/whisper-cli", "/usr/local/bin/whisper-cli"])
             .first { FileManager.default.isExecutableFile(atPath: $0) }
     }
+    static var current: Process?
     static let dir = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support/Диктовка")
     static let turbo = dir.appendingPathComponent("ggml-large-v3-turbo.bin")
     static let turboURL = URL(string: "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3-turbo.bin")!
@@ -95,6 +96,7 @@ enum Whisper {
                 return completion(.failure(NSError(domain: "whisper", code: 1, userInfo: [NSLocalizedDescriptionKey: "whisper-cli не найден"])))
             }
             let p = Process()
+            current = p
             p.executableURL = URL(fileURLWithPath: bin)
             guard let model = model else {
                 return completion(.failure(NSError(domain: "whisper", code: 2, userInfo: [NSLocalizedDescriptionKey: "Модель ещё не скачана"])))
@@ -105,8 +107,11 @@ enum Whisper {
             p.standardError = FileHandle.nullDevice
             do {
                 try p.run()
+                var timedOut = false
+                DispatchQueue.global().asyncAfter(deadline: .now() + 90) { if p.isRunning { timedOut = true; p.terminate() } }
                 let data = out.fileHandleForReading.readDataToEndOfFile()
                 p.waitUntilExit()
+                if timedOut { return completion(.failure(NSError(domain: "whisper", code: 3, userInfo: [NSLocalizedDescriptionKey: "Слишком долго, попробуй ещё раз"]))) }
                 var text = String(data: data, encoding: .utf8) ?? ""
                 text = text.replacingOccurrences(of: "\\[[A-Z_ ]+\\]|\\([^)]*\\)", with: "", options: .regularExpression)
                 text = clean(text)
@@ -527,6 +532,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     var lang: String { UserDefaults.standard.string(forKey: "lang") ?? "auto" }
     var targetApp: NSRunningApplication?
 
+    func applicationWillTerminate(_ n: Notification) { Whisper.current?.terminate() }
+
     func applicationDidFinishLaunching(_ n: Notification) {
         setupPanel()
         setupMenu()
@@ -542,6 +549,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         Timer.scheduledTimer(withTimeInterval: 1 / 30, repeats: true) { [weak self] _ in
             guard let self = self, self.model.phase == .recording else { return }
+            // страховка: опция отпущена, а событие потерялось, или запись слишком длинная
+            if (!self.viaMenu && !NSEvent.modifierFlags.contains(.option)) || Date().timeIntervalSince(self.startTime) > 180 { self.stopRecording(); return }
             self.model.history.removeFirst()
             self.model.history.append(self.model.level)
         }
@@ -554,6 +563,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    var viaMenu = false
     var downloader: Downloader?
     func downloadModel() {
         let d = Downloader()
@@ -572,8 +582,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func flags(_ e: NSEvent) {
+        if recording && !viaMenu && !e.modifierFlags.contains(.option) { stopRecording(); return }
         guard e.keyCode == 61 else { return } // right option
-        if e.modifierFlags.contains(.option) { if !recording { startRecording() } }
+        if e.modifierFlags.contains(.option) { if !recording { viaMenu = false; startRecording() } }
         else if recording { stopRecording() }
     }
 
@@ -644,7 +655,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         NSApp.activate(ignoringOtherApps: true)
         settingsWindow?.makeKeyAndOrderFront(nil)
     }
-    @objc func toggle() { recording ? stopRecording() : startRecording() }
+    @objc func toggle() { if recording { stopRecording() } else { viaMenu = true; startRecording() } }
 
     func startRecording() {
         guard model.phase == .idle || model.phase == .done || model.phase == .error else { return }

@@ -12,7 +12,9 @@ cp Info.plist "$APP/Contents/Info.plist"; cp icon/AppIcon.icns "$APP/Contents/Re
 
 swiftc -O -swift-version 5 -o "$APP/Contents/MacOS/Diktovka" main.swift
 # подписываем вложенные бинарники отдельно, затем всё приложение
-for f in "$APP"/Contents/Resources/whisper/bin/* "$APP"/Contents/Resources/whisper/lib/*; do codesign --force --options runtime --timestamp --sign "$ID" "$f"; done
+for f in "$APP"/Contents/Resources/whisper/bin/*.so "$APP"/Contents/Resources/whisper/lib/*; do codesign --force --options runtime --timestamp --sign "$ID" "$f"; done
+# whisper-cli: нужны disable-library-validation / JIT, иначе Metal не подгружается и расшифровка идёт на CPU (очень медленно)
+codesign --force --options runtime --timestamp --entitlements whisper.entitlements --sign "$ID" "$APP"/Contents/Resources/whisper/bin/whisper-cli
 codesign --force --deep --options runtime --timestamp --entitlements entitlements.plist --sign "$ID" "$APP"
 codesign --verify --deep --strict "$APP"
 
