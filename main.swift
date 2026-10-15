@@ -299,10 +299,12 @@ final class Prefs: ObservableObject {
     @Published var style: Int { didSet { UserDefaults.standard.set(style, forKey: "style"); NotificationCenter.default.post(name: .prefsChanged, object: nil) } }
     @Published var opacity: Double { didSet { UserDefaults.standard.set(opacity, forKey: "opacity"); NotificationCenter.default.post(name: .prefsChanged, object: nil) } }
     @Published var position: Int { didSet { UserDefaults.standard.set(position, forKey: "position"); NotificationCenter.default.post(name: .prefsChanged, object: nil) } }
+    @Published var autoSend: Bool { didSet { UserDefaults.standard.set(autoSend, forKey: "autoSend") } }
     @Published var micUID: String { didSet { UserDefaults.standard.set(micUID, forKey: "micUID") } }
     @Published var scale: Double { didSet { UserDefaults.standard.set(scale, forKey: "scale"); NotificationCenter.default.post(name: .prefsChanged, object: nil) } }
     init() {
         micUID = UserDefaults.standard.string(forKey: "micUID") ?? ""
+        autoSend = UserDefaults.standard.bool(forKey: "autoSend")
         position = UserDefaults.standard.object(forKey: "position") as? Int ?? 7
         let sc = UserDefaults.standard.double(forKey: "scale")
         scale = sc == 0 ? 1 : sc
@@ -743,6 +745,7 @@ struct SettingsView: View {
             .onReceive(Timer.publish(every: 1, on: .main, in: .common).autoconnect()) { _ in
                 permState = Perm.allCases.map { $0.granted }
             }
+            Toggle("Отправлять сразу: нажимать Enter после вставки текста", isOn: $prefs.autoSend)
             Toggle("Запускать при входе в систему", isOn: Binding(
                 get: { launchAtLogin },
                 set: { v in
@@ -1198,7 +1201,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
             let up = CGEvent(keyboardEventSource: src, virtualKey: 9, keyDown: false)
             down?.flags = .maskCommand; up?.flags = .maskCommand
             down?.post(tap: .cghidEventTap); up?.post(tap: .cghidEventTap)
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) {
+            if Prefs.shared.autoSend {
+                // «отправить сразу»: Enter через короткую паузу, когда приложение приняло вставку
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
+                    let d = CGEvent(keyboardEventSource: src, virtualKey: 36, keyDown: true)
+                    let u = CGEvent(keyboardEventSource: src, virtualKey: 36, keyDown: false)
+                    d?.post(tap: .cghidEventTap); u?.post(tap: .cghidEventTap)
+                }
+            }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) {
                 guard let saved = saved, !saved.isEmpty else { return }
                 pb.clearContents()
                 for d in saved {
