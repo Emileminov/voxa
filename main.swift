@@ -886,6 +886,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
     }
     var monitorWithAccess = false
     var permItems: [NSMenuItem] = []
+    var permHeader: NSMenuItem?
 
     func installGlobalMonitor() {
         if let m = globalMonitor { NSEvent.removeMonitor(m) }
@@ -1029,8 +1030,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
         menu.addItem(hint)
         menu.addItem(NSMenuItem(title: recording ? "Остановить запись" : "Начать запись", action: #selector(toggle), keyEquivalent: ""))
         menu.addItem(.separator())
-        let head = NSMenuItem(title: "Разрешения (по порядку):", action: nil, keyEquivalent: "")
+        let head = NSMenuItem(title: "Нужны разрешения (по порядку):", action: nil, keyEquivalent: "")
         head.isEnabled = false
+        permHeader = head
         menu.addItem(head)
         permItems = Perm.allCases.map { p in
             let it = NSMenuItem(title: "", action: #selector(grantPerm(_:)), keyEquivalent: "")
@@ -1049,11 +1051,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
         statusItem.menu = menu
     }
 
+    /// Выданные разрешения скрываем; показываем только недостающие (все они всегда видны в настройках).
     func refreshPermItems() {
         for it in permItems {
             guard let p = Perm(rawValue: it.tag) else { continue }
-            it.title = "\(p.rawValue + 1). \(p.title) — \(p.granted ? "✓ выдано" : "выдать… (\(p.why))")"
+            it.isHidden = p.granted
+            it.title = "\(p.rawValue + 1). \(p.title): выдать… (\(p.why))"
         }
+        permHeader?.isHidden = Perm.allGranted
     }
 
     func menuWillOpen(_ menu: NSMenu) { refreshPermItems() }
