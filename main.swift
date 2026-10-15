@@ -3,6 +3,7 @@ import SwiftUI
 import AVFoundation
 import Combine
 import ServiceManagement
+import Carbon.HIToolbox
 
 // MARK: - Model
 
@@ -592,7 +593,7 @@ struct SettingsView: View {
                     do { if v { try SMAppService.mainApp.register() } else { try SMAppService.mainApp.unregister() } } catch {}
                     launchAtLogin = SMAppService.mainApp.status == .enabled
                 }))
-            Text("Зажми правый ⌥ и говори").font(.footnote).foregroundColor(.secondary)
+            Text("Зажми правый ⌥ и говори, или нажми ⌃⌥Пробел (старт/стоп)").font(.footnote).foregroundColor(.secondary)
         }
         .padding(22)
         .frame(width: 710)
@@ -671,6 +672,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // Hold Right Option to talk
         NSEvent.addLocalMonitorForEvents(matching: .flagsChanged) { [weak self] e in self?.flags(e); return e }
         installGlobalMonitor()
+        installCarbonHotkey()
         // ждём выдачи прав: глобальный монитор нужно ставить заново, когда «Мониторинг ввода» включили
         Timer.scheduledTimer(withTimeInterval: 1.5, repeats: true) { [weak self] _ in
             guard let self = self else { return }
@@ -698,6 +700,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     var viaMenu = false
     var globalMonitor: Any?
+    var hotKeyRef: EventHotKeyRef?
+
+    /// Запасная горячая клавиша ⌃⌥Пробел (нажал — запись, нажал ещё раз — стоп). Не требует «Мониторинг ввода».
+    func installCarbonHotkey() {
+        var spec = EventTypeSpec(eventClass: OSType(kEventClassKeyboard), eventKind: UInt32(kEventHotKeyPressed))
+        InstallEventHandler(GetApplicationEventTarget(), { _, _, ud in
+            let me = Unmanaged<AppDelegate>.fromOpaque(ud!).takeUnretainedValue()
+            DispatchQueue.main.async { me.toggle() }
+            return noErr
+        }, 1, &spec, Unmanaged.passUnretained(self).toOpaque(), nil)
+        let id = EventHotKeyID(signature: 0x53485054, id: 1)
+        RegisterEventHotKey(UInt32(kVK_Space), UInt32(controlKey | optionKey), id, GetApplicationEventTarget(), 0, &hotKeyRef)
+    }
     var monitorWithAccess = false
     var permItems: [NSMenuItem] = []
 
@@ -837,7 +852,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     func rebuildMenu() {
         let menu = NSMenu()
-        let hint = NSMenuItem(title: "Зажми правый ⌥ и говори", action: nil, keyEquivalent: "")
+        let hint = NSMenuItem(title: "Зажми правый ⌥ или нажми ⌃⌥Пробел", action: nil, keyEquivalent: "")
         hint.isEnabled = false
         menu.addItem(hint)
         menu.addItem(NSMenuItem(title: recording ? "Остановить запись" : "Начать запись", action: #selector(toggle), keyEquivalent: ""))
@@ -890,6 +905,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc func toggle() { if recording { stopRecording() } else { viaMenu = true; startRecording() } }
 
     func startRecording() {
+        if Whisper.model == nil {
+            if downloader == nil { downloadModel() } else { showPanel() }   // модель ещё качается — показываем прогресс
+            return
+        }
         if previewing { stopPreview(); model.phase = .idle }
         guard model.phase == .idle || model.phase == .done || model.phase == .error else { return }
         targetApp = NSWorkspace.shared.frontmostApplication
