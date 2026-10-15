@@ -129,17 +129,17 @@ enum Whisper {
     }
 }
 
-extension Notification.Name { static let positionChanged = Notification.Name("positionChanged") }
+extension Notification.Name { static let prefsChanged = Notification.Name("prefsChanged") }
 let panelW: CGFloat = 720, panelH: CGFloat = 340
 
 // MARK: - Prefs
 
 final class Prefs: ObservableObject {
     static let shared = Prefs()
-    @Published var style: Int { didSet { UserDefaults.standard.set(style, forKey: "style") } }
-    @Published var opacity: Double { didSet { UserDefaults.standard.set(opacity, forKey: "opacity") } }
-    @Published var position: Int { didSet { UserDefaults.standard.set(position, forKey: "position"); NotificationCenter.default.post(name: .positionChanged, object: nil) } }
-    @Published var scale: Double { didSet { UserDefaults.standard.set(scale, forKey: "scale") } }
+    @Published var style: Int { didSet { UserDefaults.standard.set(style, forKey: "style"); NotificationCenter.default.post(name: .prefsChanged, object: nil) } }
+    @Published var opacity: Double { didSet { UserDefaults.standard.set(opacity, forKey: "opacity"); NotificationCenter.default.post(name: .prefsChanged, object: nil) } }
+    @Published var position: Int { didSet { UserDefaults.standard.set(position, forKey: "position"); NotificationCenter.default.post(name: .prefsChanged, object: nil) } }
+    @Published var scale: Double { didSet { UserDefaults.standard.set(scale, forKey: "scale"); NotificationCenter.default.post(name: .prefsChanged, object: nil) } }
     init() {
         position = UserDefaults.standard.object(forKey: "position") as? Int ?? 7
         let sc = UserDefaults.standard.double(forKey: "scale")
@@ -592,14 +592,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let opts = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary
         _ = AXIsProcessTrustedWithOptions(opts)
 
-        NotificationCenter.default.addObserver(forName: .positionChanged, object: nil, queue: .main) { [weak self] _ in
-            guard let self = self, self.model.phase == .idle || self.model.phase == .done else { return }
-            self.model.phase = .done
-            self.showPanel()
-            self.hidePanel(after: 1.4)
-        }
+        NotificationCenter.default.addObserver(forName: .prefsChanged, object: nil, queue: .main) { [weak self] _ in self?.showPreview() }
         Whisper.migrateOldDir()
-        if let path = ProcessInfo.processInfo.environment["SHEPOT_SETTINGS_SHOT"] {
+        let env0 = ProcessInfo.processInfo.environment
+        if let path = env0["SHEPOT_PREVIEW_SHOT"] {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { Prefs.shared.style = 1; Prefs.shared.opacity = 0.8 }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in
+                guard let self = self else { exit(1) }
+                print("phase=\(self.model.phase) visible=\(self.model.visible) panelVisible=\(self.panel.isVisible) previewing=\(self.previewing)")
+                let r = ImageRenderer(content: ZStack { Color(white: 0.3); OverlayView(m: self.model) }.frame(width: panelW, height: panelH))
+                if let t = r.nsImage?.tiffRepresentation, let png = NSBitmapImageRep(data: t)?.representation(using: .png, properties: [:]) { try? png.write(to: URL(fileURLWithPath: path)) }
+            }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 4.0) { [weak self] in
+                print("after: phase=\(String(describing: self?.model.phase)) panelVisible=\(String(describing: self?.panel.isVisible))"); exit(0)
+            }
+            return
+        }
+        if let path = env0["SHEPOT_SETTINGS_SHOT"] {
             DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
                 let r = ImageRenderer(content: SettingsView().background(Color(white: 0.16)).environment(\.colorScheme, .dark))
                 r.scale = 2
@@ -608,7 +617,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
             return
         }
-        if let d = ProcessInfo.processInfo.environment["SHEPOT_DEMO"] { runDemo(d); return }
+        if let d = env0["SHEPOT_DEMO"] { runDemo(d); return }
         if Whisper.model == nil { downloadModel() }
 
         // Hold Right Option to talk
@@ -618,7 +627,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         Timer.scheduledTimer(withTimeInterval: 1 / 30, repeats: true) { [weak self] _ in
             guard let self = self, self.model.phase == .recording else { return }
             // страховка: опция отпущена, а событие потерялось, или запись слишком длинная
-            if (!self.viaMenu && !NSEvent.modifierFlags.contains(.option)) || Date().timeIntervalSince(self.startTime) > 180 { self.stopRecording(); return }
+            if self.recording && ((!self.viaMenu && !NSEvent.modifierFlags.contains(.option)) || Date().timeIntervalSince(self.startTime) > 180) { self.stopRecording(); return }
             self.model.history.removeFirst()
             self.model.history.append(self.model.level)
         }
@@ -632,6 +641,39 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     var viaMenu = false
+    var previewing = false
+    var previewTimer: Timer?
+    var previewWork: DispatchWorkItem?
+
+    /// Живой предпросмотр индикатора при смене настроек (стиль, размер, прозрачность, положение)
+    func showPreview() {
+        guard !recording, previewing || [.idle, .done, .error].contains(model.phase) else { return }
+        previewing = true
+        model.phase = .recording
+        showPanel()
+        if previewTimer == nil {
+            let t0 = Date()
+            previewTimer = Timer.scheduledTimer(withTimeInterval: 1 / 30, repeats: true) { [weak self] _ in
+                let t = Date().timeIntervalSince(t0)
+                self?.model.level = CGFloat(min(1, abs(sin(t * 2.3) * 0.55 + sin(t * 5.7) * 0.3) + 0.2))
+            }
+        }
+        previewWork?.cancel()
+        let w = DispatchWorkItem { [weak self] in
+            guard let self = self, self.previewing else { return }
+            self.stopPreview()
+            self.model.phase = .done
+            self.hidePanel(after: 0)
+        }
+        previewWork = w
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2.2, execute: w)
+    }
+
+    func stopPreview() {
+        previewing = false
+        previewTimer?.invalidate(); previewTimer = nil
+        previewWork?.cancel()
+    }
     var downloader: Downloader?
     func downloadModel() {
         let d = Downloader()
@@ -761,6 +803,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     @objc func toggle() { if recording { stopRecording() } else { viaMenu = true; startRecording() } }
 
     func startRecording() {
+        if previewing { stopPreview(); model.phase = .idle }
         guard model.phase == .idle || model.phase == .done || model.phase == .error else { return }
         targetApp = NSWorkspace.shared.frontmostApplication
         try? FileManager.default.removeItem(at: wavURL)
