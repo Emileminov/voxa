@@ -685,7 +685,21 @@ struct SettingsView: View {
     var body: some View {
         ScrollView(.vertical, showsIndicators: true) {
         VStack(alignment: .leading, spacing: 18) {
-            Toggle("Отправлять сразу: нажимать Enter после вставки текста", isOn: $prefs.autoSend).font(.headline)
+            Button { prefs.autoSend.toggle() } label: {
+                HStack(spacing: 12) {
+                    Image(systemName: prefs.autoSend ? "checkmark.square.fill" : "square")
+                        .font(.system(size: 22)).foregroundColor(prefs.autoSend ? .accentColor : .secondary)
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("Отправлять сразу").font(.headline)
+                        Text("После расшифровки текст вставляется и сразу нажимается Enter").font(.footnote).foregroundColor(.secondary)
+                    }
+                    Spacer()
+                }
+                .padding(12)
+                .background(RoundedRectangle(cornerRadius: 12).fill(Color.gray.opacity(0.14)))
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
             Text("Вид анимации").font(.headline)
             HStack(spacing: 14) { ForEach(0..<4, id: \.self) { card($0) } }
             HStack(spacing: 12) {
@@ -818,10 +832,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
                 guard let w = self?.settingsWindow, let host = w.contentView as? NSHostingView<SettingsView> else { exit(1) }
                 print("window content:", w.contentView!.frame.size, "window frame:", w.frame.size, "screen:", NSScreen.main!.visibleFrame.size)
                 if let path = env0["VOXA_WINDOWTEST"], path.hasPrefix("/"), let v = w.contentView {
-                    let rep = v.bitmapImageRepForCachingDisplay(in: v.bounds)!
-                    v.cacheDisplay(in: v.bounds, to: rep)
-                    try? rep.representation(using: .png, properties: [:])?.write(to: URL(fileURLWithPath: path))
+                    try? v.dataWithPDF(inside: v.bounds).write(to: URL(fileURLWithPath: path))
                 }
+                if env0["VOXA_KEEP"] != nil { return }
                 exit(0)
             }
             return
@@ -1094,7 +1107,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
         }
         refreshPermItems()
         menu.addItem(.separator())
-        menu.addItem(NSMenuItem(title: "Скопировать диагностику", action: #selector(copyDiagnostics), keyEquivalent: ""))
         menu.addItem(NSMenuItem(title: "Настройки…", action: #selector(openSettings), keyEquivalent: ","))
         menu.addItem(.separator())
         menu.addItem(NSMenuItem(title: "Выйти", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
