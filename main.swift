@@ -407,8 +407,9 @@ struct BarsView: View {
                         default: return 0.08
                         }
                     }()
+                    let pal = phasePalette(m.phase)
                     Capsule()
-                        .fill(LinearGradient(colors: [Color(red: 1, green: 0.5, blue: 0.6), Color(red: 0.6, green: 0.4, blue: 1)], startPoint: .top, endPoint: .bottom))
+                        .fill(LinearGradient(colors: [pal[0], pal[min(2, pal.count - 1)]], startPoint: .top, endPoint: .bottom))
                         .frame(width: 3, height: 3 + max(0, h) * 24)
                 }
             }
@@ -591,6 +592,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             self.showPanel()
             self.hidePanel(after: 1.4)
         }
+        if let path = ProcessInfo.processInfo.environment["DIKTOVKA_SETTINGS_SHOT"] {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
+                let r = ImageRenderer(content: SettingsView().background(Color(white: 0.16)).environment(\.colorScheme, .dark))
+                r.scale = 2
+                if let t = r.nsImage?.tiffRepresentation, let png = NSBitmapImageRep(data: t)?.representation(using: .png, properties: [:]) { try? png.write(to: URL(fileURLWithPath: path)) }
+                exit(0)
+            }
+            return
+        }
+        if let d = ProcessInfo.processInfo.environment["DIKTOVKA_DEMO"] { runDemo(d); return }
         if Whisper.model == nil { downloadModel() }
 
         // Hold Right Option to talk
@@ -629,6 +640,35 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             else { self.flash("Не удалось скачать модель") }
         }
         d.start()
+    }
+
+    /// Режим для проверки внешнего вида: DIKTOVKA_DEMO=recording|transcribing|done, DIKTOVKA_STYLE, DIKTOVKA_POS
+    func runDemo(_ phase: String) {
+        let env = ProcessInfo.processInfo.environment
+        if let v = env["DIKTOVKA_STYLE"], let i = Int(v) { Prefs.shared.style = i }
+        if let v = env["DIKTOVKA_POS"], let i = Int(v) { Prefs.shared.position = i }
+        if let v = env["DIKTOVKA_SCALE"], let d = Double(v) { Prefs.shared.scale = d }
+        model.phase = phase == "transcribing" ? .transcribing : (phase == "done" ? .done : .recording)
+        showPanel()
+        let t0 = Date()
+        if let path = env["DIKTOVKA_SHOT"] {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.8) { [weak self] in
+                guard let self = self else { exit(1) }
+                let bg = Double(env["DIKTOVKA_BG"] ?? "0.45") ?? 0.45
+                let r = ImageRenderer(content: ZStack { Color(white: bg); OverlayView(m: self.model) }.frame(width: panelW, height: panelH))
+                r.scale = 2
+                if let img = r.nsImage, let tiff = img.tiffRepresentation, let png = NSBitmapImageRep(data: tiff)?.representation(using: .png, properties: [:]) {
+                    try? png.write(to: URL(fileURLWithPath: path))
+                }
+                exit(0)
+            }
+        }
+        Timer.scheduledTimer(withTimeInterval: 1 / 30, repeats: true) { [weak self] _ in
+            guard let m = self?.model else { return }
+            let t = Date().timeIntervalSince(t0)
+            m.level = CGFloat(min(1, abs(sin(t * 2.3) * 0.6 + sin(t * 5.7) * 0.3) + 0.25))
+            m.history.removeFirst(); m.history.append(m.level)
+        }
     }
 
     func flags(_ e: NSEvent) {
