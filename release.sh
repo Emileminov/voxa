@@ -5,12 +5,12 @@ set -e
 cd "$(dirname "$0")"
 ID="${SIGN_ID:-Developer ID Application: Emil EMINOV (4AR298V292)}"
 PROFILE="${NOTARY_PROFILE:-launchpad-notary}"
-APP="Диктовка.app"; DMG="Diktovka.dmg"
+APP="Шёпот.app"; DMG="Shepot.dmg"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cp Info.plist "$APP/Contents/Info.plist"; cp icon/AppIcon.icns "$APP/Contents/Resources/"
 ./bundle_whisper.sh "$APP"
 
-swiftc -O -swift-version 5 -o "$APP/Contents/MacOS/Diktovka" main.swift
+swiftc -O -swift-version 5 -o "$APP/Contents/MacOS/Shepot" main.swift
 # подписываем вложенные бинарники отдельно, затем всё приложение
 for f in "$APP"/Contents/Resources/whisper/bin/*.so "$APP"/Contents/Resources/whisper/lib/*; do codesign --force --options runtime --timestamp --sign "$ID" "$f"; done
 # whisper-cli: нужны disable-library-validation / JIT, иначе Metal не подгружается и расшифровка идёт на CPU (очень медленно)
@@ -25,7 +25,7 @@ xcrun stapler staple "$APP"
 
 rm -rf dmg_root "$DMG"; mkdir dmg_root
 cp -R "$APP" dmg_root/; ln -s /Applications dmg_root/Applications
-hdiutil create -volname "Диктовка" -srcfolder dmg_root -ov -format UDZO "$DMG" >/dev/null
+hdiutil create -volname "Шёпот" -srcfolder dmg_root -ov -format UDZO "$DMG" >/dev/null
 rm -rf dmg_root
 codesign --force --timestamp --sign "$ID" "$DMG"
 xcrun notarytool submit "$DMG" --keychain-profile "$PROFILE" --wait

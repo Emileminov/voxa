@@ -1,7 +1,7 @@
 #!/bin/bash
 # Кладёт whisper-cli и его библиотеки внутрь приложения (источник: brew install whisper-cpp).
 set -e
-APP="${1:-Диктовка.app}"
+APP="${1:-Шёпот.app}"
 W="$APP/Contents/Resources/whisper"
 CELL="$(dirname "$(readlink -f /opt/homebrew/bin/whisper-cli)")/.."
 GGML=/opt/homebrew/opt/ggml

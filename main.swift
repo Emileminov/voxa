@@ -70,7 +70,13 @@ enum Whisper {
             .first { FileManager.default.isExecutableFile(atPath: $0) }
     }
     static var current: Process?
-    static let dir = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support/Диктовка")
+    /// Переезд моделей из старой папки «Диктовка» (чтобы не скачивать 1,6 ГБ заново)
+    static func migrateOldDir() {
+        let fm = FileManager.default
+        let old = fm.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support/Диктовка")
+        if fm.fileExists(atPath: old.path) && !fm.fileExists(atPath: dir.path) { try? fm.moveItem(at: old, to: dir) }
+    }
+    static let dir = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support/Шёпот")
     static let turbo = dir.appendingPathComponent("ggml-large-v3-turbo.bin")
     static let turboURL = URL(string: "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3-turbo.bin")!
     static var model: String? {
@@ -573,7 +579,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     var statusItem: NSStatusItem!
     var recording = false
     var startTime = Date()
-    var wavURL = FileManager.default.temporaryDirectory.appendingPathComponent("diktovka.wav")
+    var wavURL = FileManager.default.temporaryDirectory.appendingPathComponent("shepot.wav")
     var lang: String { UserDefaults.standard.string(forKey: "lang") ?? "auto" }
     var targetApp: NSRunningApplication?
 
@@ -592,7 +598,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             self.showPanel()
             self.hidePanel(after: 1.4)
         }
-        if let path = ProcessInfo.processInfo.environment["DIKTOVKA_SETTINGS_SHOT"] {
+        Whisper.migrateOldDir()
+        if let path = ProcessInfo.processInfo.environment["SHEPOT_SETTINGS_SHOT"] {
             DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
                 let r = ImageRenderer(content: SettingsView().background(Color(white: 0.16)).environment(\.colorScheme, .dark))
                 r.scale = 2
@@ -601,7 +608,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
             return
         }
-        if let d = ProcessInfo.processInfo.environment["DIKTOVKA_DEMO"] { runDemo(d); return }
+        if let d = ProcessInfo.processInfo.environment["SHEPOT_DEMO"] { runDemo(d); return }
         if Whisper.model == nil { downloadModel() }
 
         // Hold Right Option to talk
@@ -642,19 +649,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         d.start()
     }
 
-    /// Режим для проверки внешнего вида: DIKTOVKA_DEMO=recording|transcribing|done, DIKTOVKA_STYLE, DIKTOVKA_POS
+    /// Режим для проверки внешнего вида: SHEPOT_DEMO=recording|transcribing|done, SHEPOT_STYLE, SHEPOT_POS
     func runDemo(_ phase: String) {
         let env = ProcessInfo.processInfo.environment
-        if let v = env["DIKTOVKA_STYLE"], let i = Int(v) { Prefs.shared.style = i }
-        if let v = env["DIKTOVKA_POS"], let i = Int(v) { Prefs.shared.position = i }
-        if let v = env["DIKTOVKA_SCALE"], let d = Double(v) { Prefs.shared.scale = d }
+        if let v = env["SHEPOT_STYLE"], let i = Int(v) { Prefs.shared.style = i }
+        if let v = env["SHEPOT_POS"], let i = Int(v) { Prefs.shared.position = i }
+        if let v = env["SHEPOT_SCALE"], let d = Double(v) { Prefs.shared.scale = d }
         model.phase = phase == "transcribing" ? .transcribing : (phase == "done" ? .done : .recording)
         showPanel()
         let t0 = Date()
-        if let path = env["DIKTOVKA_SHOT"] {
+        if let path = env["SHEPOT_SHOT"] {
             DispatchQueue.main.asyncAfter(deadline: .now() + 1.8) { [weak self] in
                 guard let self = self else { exit(1) }
-                let bg = Double(env["DIKTOVKA_BG"] ?? "0.45") ?? 0.45
+                let bg = Double(env["SHEPOT_BG"] ?? "0.45") ?? 0.45
                 let r = ImageRenderer(content: ZStack { Color(white: bg); OverlayView(m: self.model) }.frame(width: panelW, height: panelH))
                 r.scale = 2
                 if let img = r.nsImage, let tiff = img.tiffRepresentation, let png = NSBitmapImageRep(data: tiff)?.representation(using: .png, properties: [:]) {
@@ -717,7 +724,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func setupMenu() {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
-        statusItem.button?.image = NSImage(systemSymbolName: "waveform.circle.fill", accessibilityDescription: "Диктовка")
+        statusItem.button?.image = NSImage(systemSymbolName: "waveform.circle.fill", accessibilityDescription: "Шёпот")
         rebuildMenu()
     }
 
@@ -740,7 +747,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     @objc func openSettings() {
         if settingsWindow == nil {
             let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 710, height: 370), styleMask: [.titled, .closable], backing: .buffered, defer: false)
-            w.title = "Диктовка — настройки"
+            w.title = "Шёпот — настройки"
             w.isReleasedWhenClosed = false
             let host = NSHostingView(rootView: SettingsView())
             w.contentView = host
