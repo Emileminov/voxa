@@ -4,6 +4,7 @@ import AVFoundation
 import Combine
 import ServiceManagement
 import Carbon.HIToolbox
+import CoreAudio
 
 // MARK: - Model
 
@@ -17,14 +18,94 @@ final class Model: ObservableObject {
     @Published var history: [CGFloat] = Array(repeating: 0, count: 22)
 }
 
+// MARK: - Выбор микрофона
+
+struct InputDevice: Hashable { let uid: String; let name: String; let devID: AudioDeviceID }
+
+func audioString(_ id: AudioObjectID, _ sel: AudioObjectPropertySelector) -> String? {
+    var a = AudioObjectPropertyAddress(mSelector: sel, mScope: kAudioObjectPropertyScopeGlobal, mElement: kAudioObjectPropertyElementMain)
+    var str: Unmanaged<CFString>?
+    var sz = UInt32(MemoryLayout<Unmanaged<CFString>?>.size)
+    guard AudioObjectGetPropertyData(id, &a, 0, nil, &sz, &str) == noErr, let v = str else { return nil }
+    return v.takeRetainedValue() as String
+}
+
+func listInputDevices() -> [InputDevice] {
+    var addr = AudioObjectPropertyAddress(mSelector: kAudioHardwarePropertyDevices, mScope: kAudioObjectPropertyScopeGlobal, mElement: kAudioObjectPropertyElementMain)
+    var size: UInt32 = 0
+    let sys = AudioObjectID(kAudioObjectSystemObject)
+    guard AudioObjectGetPropertyDataSize(sys, &addr, 0, nil, &size) == noErr else { return [] }
+    var ids = [AudioDeviceID](repeating: 0, count: Int(size) / MemoryLayout<AudioDeviceID>.size)
+    guard AudioObjectGetPropertyData(sys, &addr, 0, nil, &size, &ids) == noErr else { return [] }
+    return ids.compactMap { id in
+        var cfg = AudioObjectPropertyAddress(mSelector: kAudioDevicePropertyStreamConfiguration, mScope: kAudioDevicePropertyScopeInput, mElement: kAudioObjectPropertyElementMain)
+        var sz: UInt32 = 0
+        guard AudioObjectGetPropertyDataSize(id, &cfg, 0, nil, &sz) == noErr, sz > 0 else { return nil }
+        let buf = UnsafeMutableRawPointer.allocate(byteCount: Int(sz), alignment: 16)
+        defer { buf.deallocate() }
+        guard AudioObjectGetPropertyData(id, &cfg, 0, nil, &sz, buf) == noErr else { return nil }
+        let list = UnsafeMutableAudioBufferListPointer(buf.assumingMemoryBound(to: AudioBufferList.self))
+        guard list.reduce(0, { $0 + Int($1.mNumberChannels) }) > 0 else { return nil }
+        guard let uid = audioString(id, kAudioDevicePropertyDeviceUID), let name = audioString(id, kAudioObjectPropertyName) else { return nil }
+        return InputDevice(uid: uid, name: name, devID: id)
+    }
+}
+
+func defaultInputDevice() -> InputDevice? {
+    var dev = AudioDeviceID(0); var size = UInt32(MemoryLayout<AudioDeviceID>.size)
+    var addr = AudioObjectPropertyAddress(mSelector: kAudioHardwarePropertyDefaultInputDevice, mScope: kAudioObjectPropertyScopeGlobal, mElement: kAudioObjectPropertyElementMain)
+    guard AudioObjectGetPropertyData(AudioObjectID(kAudioObjectSystemObject), &addr, 0, nil, &size, &dev) == noErr else { return nil }
+    return listInputDevices().first { $0.devID == dev }
+}
+
+/// Привязывает выбранный микрофон к входу движка (пустой uid — системный по умолчанию).
+func applyInputDevice(_ engine: AVAudioEngine, uid: String) {
+    guard !uid.isEmpty, let d = listInputDevices().first(where: { $0.uid == uid }), let au = engine.inputNode.audioUnit else { return }
+    var dev = d.devID
+    AudioUnitSetProperty(au, kAudioOutputUnitProperty_CurrentDevice, kAudioUnitScope_Global, 0, &dev, UInt32(MemoryLayout<AudioDeviceID>.size))
+}
+
+/// Живой уровень микрофона в окне настроек.
+final class MicMeter: ObservableObject {
+    static let shared = MicMeter()
+    @Published var level: Double = 0
+    private var engine: AVAudioEngine?
+
+    func start() {
+        stop()
+        guard Perm.mic.granted else { return }
+        let e = AVAudioEngine()
+        applyInputDevice(e, uid: Prefs.shared.micUID)
+        let fmt = e.inputNode.outputFormat(forBus: 0)
+        guard fmt.sampleRate > 0 else { return }
+        e.inputNode.installTap(onBus: 0, bufferSize: 1024, format: fmt) { [weak self] buf, _ in
+            guard let ch = buf.floatChannelData?[0], buf.frameLength > 0 else { return }
+            var sum: Float = 0
+            for i in 0..<Int(buf.frameLength) { sum += ch[i] * ch[i] }
+            let db = 20 * log10(max(sqrt(sum / Float(buf.frameLength)), 1e-6))
+            let v = Double(max(0, min(1, (db + 55) / 40)))
+            DispatchQueue.main.async { self?.level = max(v, (self?.level ?? 0) * 0.8) }
+        }
+        do { try e.start(); engine = e } catch { e.inputNode.removeTap(onBus: 0) }
+    }
+
+    func stop() {
+        engine?.inputNode.removeTap(onBus: 0)
+        engine?.stop(); engine = nil
+        level = 0
+    }
+}
+
 // MARK: - Recorder (16 kHz mono WAV for whisper)
 
 final class Recorder {
-    private let engine = AVAudioEngine()
+    private var engine = AVAudioEngine()
     private var file: AVAudioFile?
     var onLevel: ((Float) -> Void)?
 
     func start(to url: URL) throws {
+        engine = AVAudioEngine()
+        applyInputDevice(engine, uid: Prefs.shared.micUID)
         let input = engine.inputNode
         let inFmt = input.outputFormat(forBus: 0)
         let outFmt = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: 16000, channels: 1, interleaved: false)!
@@ -174,8 +255,10 @@ final class Prefs: ObservableObject {
     @Published var style: Int { didSet { UserDefaults.standard.set(style, forKey: "style"); NotificationCenter.default.post(name: .prefsChanged, object: nil) } }
     @Published var opacity: Double { didSet { UserDefaults.standard.set(opacity, forKey: "opacity"); NotificationCenter.default.post(name: .prefsChanged, object: nil) } }
     @Published var position: Int { didSet { UserDefaults.standard.set(position, forKey: "position"); NotificationCenter.default.post(name: .prefsChanged, object: nil) } }
+    @Published var micUID: String { didSet { UserDefaults.standard.set(micUID, forKey: "micUID") } }
     @Published var scale: Double { didSet { UserDefaults.standard.set(scale, forKey: "scale"); NotificationCenter.default.post(name: .prefsChanged, object: nil) } }
     init() {
+        micUID = UserDefaults.standard.string(forKey: "micUID") ?? ""
         position = UserDefaults.standard.object(forKey: "position") as? Int ?? 7
         let sc = UserDefaults.standard.double(forKey: "scale")
         scale = sc == 0 ? 1 : sc
@@ -501,6 +584,8 @@ struct SettingsView: View {
     @ObservedObject var prefs = Prefs.shared
     @StateObject var demo = Demo()
     @AppStorage("lang") var lang = "auto"
+    @ObservedObject var meter = MicMeter.shared
+    @State var devices: [InputDevice] = listInputDevices()
     @State var permState: [Bool] = Perm.allCases.map { $0.granted }
     @State var launchAtLogin = SMAppService.mainApp.status == .enabled
 
@@ -565,6 +650,34 @@ struct SettingsView: View {
                 positionGrid
                 Spacer()
             }
+            VStack(alignment: .leading, spacing: 6) {
+                HStack(spacing: 12) {
+                    Text("Микрофон").frame(width: 110, alignment: .leading)
+                    Picker("", selection: $prefs.micUID) {
+                        Text("Системный по умолчанию").tag("")
+                        ForEach(devices, id: \.uid) { Text($0.name).tag($0.uid) }
+                    }
+                    .labelsHidden().frame(maxWidth: 360)
+                    .onChange(of: prefs.micUID) { _ in meter.start() }
+                }
+                HStack(spacing: 12) {
+                    Text("Уровень").frame(width: 110, alignment: .leading)
+                    GeometryReader { g in
+                        ZStack(alignment: .leading) {
+                            Capsule().fill(Color.white.opacity(0.12))
+                            Capsule().fill(LinearGradient(colors: [.green, .yellow, .orange], startPoint: .leading, endPoint: .trailing))
+                                .frame(width: max(6, g.size.width * CGFloat(meter.level)))
+                        }
+                    }
+                    .frame(width: 360, height: 8)
+                    Text(Perm.mic.granted ? "говори — полоска двигается" : "нет доступа к микрофону").font(.footnote).foregroundColor(.secondary)
+                }
+            }
+            .onReceive(Timer.publish(every: 2, on: .main, in: .common).autoconnect()) { _ in
+                let d = listInputDevices(); if d != devices { devices = d }
+                if meter.level == 0 && Perm.mic.granted { meter.start() }
+            }
+            .onAppear { devices = listInputDevices(); meter.start() }
             HStack(spacing: 12) {
                 Text("Язык").frame(width: 110, alignment: .leading)
                 Picker("", selection: $lang) {
@@ -624,7 +737,9 @@ final class Downloader: NSObject, URLSessionDownloadDelegate {
 
 // MARK: - App
 
-final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
+extension ProcessInfo { var machineHardwareName: String { var u = utsname(); uname(&u); return withUnsafePointer(to: &u.machine) { $0.withMemoryRebound(to: CChar.self, capacity: 256) { String(cString: $0) } } } }
+
+final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWindowDelegate {
     let model = Model()
     let recorder = Recorder()
     var panel: NSPanel!
@@ -701,17 +816,51 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var viaMenu = false
     var globalMonitor: Any?
     var hotKeyRef: EventHotKeyRef?
+    var hotKeyStatus: OSStatus = -1
+    var logLines: [String] = []
+    func log(_ t: String) {
+        let f = DateFormatter(); f.dateFormat = "HH:mm:ss.SSS"
+        logLines.append("\(f.string(from: Date())) \(t)")
+        if logLines.count > 80 { logLines.removeFirst() }
+    }
+
+    func defaultInputName() -> String {
+        var dev = AudioDeviceID(0); var size = UInt32(MemoryLayout<AudioDeviceID>.size)
+        var addr = AudioObjectPropertyAddress(mSelector: kAudioHardwarePropertyDefaultInputDevice, mScope: kAudioObjectPropertyScopeGlobal, mElement: kAudioObjectPropertyElementMain)
+        guard AudioObjectGetPropertyData(AudioObjectID(kAudioObjectSystemObject), &addr, 0, nil, &size, &dev) == noErr, dev != 0 else { return "НЕТ микрофона по умолчанию" }
+        var name: CFString = "" as CFString; var nsize = UInt32(MemoryLayout<CFString>.size)
+        var naddr = AudioObjectPropertyAddress(mSelector: kAudioDevicePropertyDeviceNameCFString, mScope: kAudioObjectPropertyScopeGlobal, mElement: kAudioObjectPropertyElementMain)
+        _ = withUnsafeMutablePointer(to: &name) { AudioObjectGetPropertyData(dev, &naddr, 0, nil, &nsize, $0) }
+        return name as String
+    }
+
+    @objc func copyDiagnostics() {
+        let info = Bundle.main.infoDictionary
+        var out = ["Шёпот \(info?["CFBundleShortVersionString"] ?? "?") (\(info?["CFBundleVersion"] ?? "?"))",
+                   "macOS \(ProcessInfo.processInfo.operatingSystemVersionString), \(ProcessInfo.processInfo.machineHardwareName)",
+                   "Микрофон по умолчанию: \(defaultInputName())",
+                   "Разрешения: микрофон=\(Perm.mic.granted) доступ=\(Perm.access.granted) мониторинг=\(Perm.input.granted)",
+                   "Хоткей ⌃⌥Пробел: статус регистрации=\(hotKeyStatus) (0 = ок); глобальный монитор ⌥ с правами=\(monitorWithAccess)",
+                   "whisper-cli: \(Whisper.bin ?? "НЕ НАЙДЕН")",
+                   "Модель: \(Whisper.model ?? "НЕ СКАЧАНА")",
+                   "Фаза: \(model.phase), recording=\(recording), скачивание=\(downloader != nil)", "--- события ---"]
+        out += logLines
+        let text = out.joined(separator: "\n")
+        NSPasteboard.general.clearContents(); NSPasteboard.general.setString(text, forType: .string)
+        flash("Диагностика скопирована")
+    }
 
     /// Запасная горячая клавиша ⌃⌥Пробел (нажал — запись, нажал ещё раз — стоп). Не требует «Мониторинг ввода».
     func installCarbonHotkey() {
         var spec = EventTypeSpec(eventClass: OSType(kEventClassKeyboard), eventKind: UInt32(kEventHotKeyPressed))
         InstallEventHandler(GetApplicationEventTarget(), { _, _, ud in
             let me = Unmanaged<AppDelegate>.fromOpaque(ud!).takeUnretainedValue()
-            DispatchQueue.main.async { me.toggle() }
+            DispatchQueue.main.async { me.log("хоткей ⌃⌥Пробел нажат"); me.toggle() }
             return noErr
         }, 1, &spec, Unmanaged.passUnretained(self).toOpaque(), nil)
         let id = EventHotKeyID(signature: 0x53485054, id: 1)
-        RegisterEventHotKey(UInt32(kVK_Space), UInt32(controlKey | optionKey), id, GetApplicationEventTarget(), 0, &hotKeyRef)
+        hotKeyStatus = RegisterEventHotKey(UInt32(kVK_Space), UInt32(controlKey | optionKey), id, GetApplicationEventTarget(), 0, &hotKeyRef)
+        log("регистрация хоткея ⌃⌥Пробел: \(hotKeyStatus)")
     }
     var monitorWithAccess = false
     var permItems: [NSMenuItem] = []
@@ -801,6 +950,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     func flags(_ e: NSEvent) {
+        log("flagsChanged key=\(e.keyCode) option=\(e.modifierFlags.contains(.option)) recording=\(recording)")
         if recording && !viaMenu && !e.modifierFlags.contains(.option) { stopRecording(); return }
         guard e.keyCode == 61 else { return } // right option
         if e.modifierFlags.contains(.option) { if !recording { viaMenu = false; startRecording() } }
@@ -868,6 +1018,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         refreshPermItems()
         menu.addItem(.separator())
+        menu.addItem(NSMenuItem(title: "Скопировать диагностику", action: #selector(copyDiagnostics), keyEquivalent: ""))
         menu.addItem(NSMenuItem(title: "Настройки…", action: #selector(openSettings), keyEquivalent: ","))
         menu.addItem(.separator())
         menu.addItem(NSMenuItem(title: "Выйти", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
@@ -888,11 +1039,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc func grantPerm(_ s: NSMenuItem) { Perm(rawValue: s.tag)?.request() }
 
     var settingsWindow: NSWindow?
+    func windowWillClose(_ n: Notification) { MicMeter.shared.stop() }
+
     @objc func openSettings() {
         if settingsWindow == nil {
             let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 710, height: 370), styleMask: [.titled, .closable], backing: .buffered, defer: false)
             w.title = "Шёпот — настройки"
             w.isReleasedWhenClosed = false
+            w.delegate = self
             let host = NSHostingView(rootView: SettingsView())
             w.contentView = host
             w.setContentSize(host.fittingSize)
@@ -901,19 +1055,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         NSApp.activate(ignoringOtherApps: true)
         settingsWindow?.makeKeyAndOrderFront(nil)
+        MicMeter.shared.start()
     }
     @objc func toggle() { if recording { stopRecording() } else { viaMenu = true; startRecording() } }
 
     func startRecording() {
+        log("startRecording phase=\(model.phase) model=\(Whisper.model != nil)")
         if Whisper.model == nil {
             if downloader == nil { downloadModel() } else { showPanel() }   // модель ещё качается — показываем прогресс
             return
         }
         if previewing { stopPreview(); model.phase = .idle }
-        guard model.phase == .idle || model.phase == .done || model.phase == .error else { return }
+        guard model.phase == .idle || model.phase == .done || model.phase == .error else { log("старт отклонён: фаза \(model.phase)"); return }
         targetApp = NSWorkspace.shared.frontmostApplication
+        MicMeter.shared.stop()
         try? FileManager.default.removeItem(at: wavURL)
-        do { try recorder.start(to: wavURL) } catch { flash("Нет доступа к микрофону"); return }
+        do { try recorder.start(to: wavURL); log("запись пошла") } catch { log("ОШИБКА записи: \(error)"); flash("Нет доступа к микрофону"); return }
         recording = true; startTime = Date()
         model.level = 0
         model.history = Array(repeating: 0, count: 22)
@@ -925,6 +1082,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     func stopRecording() {
+        log("stopRecording, длительность \(String(format: "%.1f", Date().timeIntervalSince(startTime))) с")
         recording = false
         recorder.stop()
         statusItem.button?.image = NSImage(systemSymbolName: "waveform.circle.fill", accessibilityDescription: nil)
@@ -936,12 +1094,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 guard let self = self else { return }
                 switch r {
                 case .success(let text):
+                    self.log("whisper: \(text.count) символов")
                     if text.isEmpty { self.flash("Ничего не услышал"); return }
                     self.model.phase = .done
                     NSSound(named: "Pop")?.play()
                     self.insert(text)
                     self.hidePanel(after: 1.1)
-                case .failure(let e): self.flash(e.localizedDescription)
+                case .failure(let e): self.log("whisper ошибка: \(e.localizedDescription)"); self.flash(e.localizedDescription)
                 }
             }
         }
