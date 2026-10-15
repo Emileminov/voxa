@@ -31,15 +31,31 @@ final class AudioCapture: NSObject, AVCaptureAudioDataOutputSampleBufferDelegate
     private let session = AVCaptureSession()
     private let queue = DispatchQueue(label: "shepot.audio")
     var onBuffer: ((AVAudioPCMBuffer) -> Void)?
+    private(set) var ok = 0, failed = 0
+    private(set) var lastFormat = "—"
+    private(set) var lastError = ""
+    private(set) var deviceName = "—"
+    private var obs: [NSObjectProtocol] = []
+
+    var stats: String { "устройство=\(deviceName) буферов ok=\(ok) сбоев=\(failed) формат=\(lastFormat) ошибка=\(lastError.isEmpty ? "нет" : lastError)" }
 
     func start(uid: String) throws {
         stop()
+        ok = 0; failed = 0; lastFormat = "—"; lastError = ""
         guard let dev = (uid.isEmpty ? nil : AVCaptureDevice(uniqueID: uid)) ?? AVCaptureDevice.default(for: .audio) else {
             throw NSError(domain: "audio", code: 1, userInfo: [NSLocalizedDescriptionKey: "Микрофон не найден"])
         }
+        deviceName = dev.localizedName
         let input = try AVCaptureDeviceInput(device: dev)
         let out = AVCaptureAudioDataOutput()
+        // любой микрофон (моно/стерео/многоканальный, любая частота) отдаём системой сразу как 16 кГц моно float32
+        out.audioSettings = [AVFormatIDKey: kAudioFormatLinearPCM, AVSampleRateKey: 16000, AVNumberOfChannelsKey: 1,
+                             AVLinearPCMBitDepthKey: 32, AVLinearPCMIsFloatKey: true,
+                             AVLinearPCMIsNonInterleaved: false, AVLinearPCMIsBigEndianKey: false]
         out.setSampleBufferDelegate(self, queue: queue)
+        obs = [NotificationCenter.default.addObserver(forName: .AVCaptureSessionRuntimeError, object: session, queue: nil) { [weak self] n in
+            self?.lastError = (n.userInfo?[AVCaptureSessionErrorKey] as? NSError)?.localizedDescription ?? "ошибка сессии"
+        }]
         session.beginConfiguration()
         guard session.canAddInput(input), session.canAddOutput(out) else {
             session.commitConfiguration()
@@ -51,6 +67,7 @@ final class AudioCapture: NSObject, AVCaptureAudioDataOutputSampleBufferDelegate
     }
 
     func stop() {
+        obs.forEach { NotificationCenter.default.removeObserver($0) }; obs = []
         let s = session
         queue.sync {
             if s.isRunning { s.stopRunning() }
@@ -62,11 +79,14 @@ final class AudioCapture: NSObject, AVCaptureAudioDataOutputSampleBufferDelegate
     func captureOutput(_ output: AVCaptureOutput, didOutput sb: CMSampleBuffer, from c: AVCaptureConnection) {
         guard let fd = CMSampleBufferGetFormatDescription(sb),
               let asbd = CMAudioFormatDescriptionGetStreamBasicDescription(fd),
-              let fmt = AVAudioFormat(streamDescription: asbd) else { return }
+              let fmt = AVAudioFormat(streamDescription: asbd) else { failed += 1; lastError = "неизвестный формат звука"; return }
+        lastFormat = "\(Int(fmt.sampleRate)) Гц, \(fmt.channelCount) кан."
         let n = CMSampleBufferGetNumSamples(sb)
         guard n > 0, let pcm = AVAudioPCMBuffer(pcmFormat: fmt, frameCapacity: AVAudioFrameCount(n)) else { return }
         pcm.frameLength = AVAudioFrameCount(n)
-        guard CMSampleBufferCopyPCMDataIntoAudioBufferList(sb, at: 0, frameCount: Int32(n), into: pcm.mutableAudioBufferList) == noErr else { return }
+        let st = CMSampleBufferCopyPCMDataIntoAudioBufferList(sb, at: 0, frameCount: Int32(n), into: pcm.mutableAudioBufferList)
+        guard st == noErr else { failed += 1; lastError = "копирование звука: \(st)"; return }
+        ok += 1
         onBuffer?(pcm)
     }
 }
@@ -138,7 +158,9 @@ final class Recorder {
     private(set) var frames = 0
     var onLevel: ((Float) -> Void)?
 
-    func start(to url: URL) throws {
+    var stats: String { cap.stats }
+
+    func start(to url: URL, forceDefault: Bool = false) throws {
         if let e = micAccessError() { throw e }
         frames = 0
         file = try AVAudioFile(forWriting: url, settings: [
@@ -151,7 +173,7 @@ final class Recorder {
             try? self.file?.write(from: out)
             self.onLevel?(lv)
         }
-        try cap.start(uid: Prefs.shared.micUID)
+        try cap.start(uid: forceDefault ? "" : Prefs.shared.micUID)
     }
 
     func stop() {
@@ -1106,15 +1128,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
         statusItem.button?.image = NSImage(systemSymbolName: "record.circle.fill", accessibilityDescription: nil)
         NSSound(named: "Tink")?.play()
         rebuildMenu()
-        DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) { [weak self] in
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in
             guard let self = self, self.recording, self.recorder.frames == 0 else { return }
-            self.log("нет данных с микрофона за 2 с")
-            self.recording = false; self.recorder.stop()
-            self.flash("Микрофон не передаёт звук. Выбери другой в настройках")
+            self.log("нет данных с микрофона за 1,5 с: \(self.recorder.stats)")
+            if !Prefs.shared.micUID.isEmpty {
+                // выбранный микрофон молчит — пробуем системный по умолчанию
+                self.recorder.stop()
+                do { try self.recorder.start(to: self.wavURL, forceDefault: true); self.log("откат на системный микрофон") } catch { self.log("откат не удался: \(error)") }
+                DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in
+                    guard let self = self, self.recording, self.recorder.frames == 0 else { return }
+                    self.log("и системный молчит: \(self.recorder.stats)")
+                    self.recording = false; self.recorder.stop()
+                    self.flash("Микрофон не передаёт звук")
+                }
+            } else {
+                self.recording = false; self.recorder.stop()
+                self.flash("Микрофон не передаёт звук. Выбери другой в настройках")
+            }
         }
     }
 
     func stopRecording() {
+        log("запись: \(recorder.stats), кадров \(recorder.frames)")
         log("stopRecording, длительность \(String(format: "%.1f", Date().timeIntervalSince(startTime))) с")
         recording = false
         recorder.stop()
