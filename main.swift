@@ -18,127 +18,145 @@ final class Model: ObservableObject {
     @Published var history: [CGFloat] = Array(repeating: 0, count: 22)
 }
 
-// MARK: - Выбор микрофона
+// MARK: - Выбор микрофона и захват звука
 
-struct InputDevice: Hashable { let uid: String; let name: String; let devID: AudioDeviceID }
-
-func audioString(_ id: AudioObjectID, _ sel: AudioObjectPropertySelector) -> String? {
-    var a = AudioObjectPropertyAddress(mSelector: sel, mScope: kAudioObjectPropertyScopeGlobal, mElement: kAudioObjectPropertyElementMain)
-    var str: Unmanaged<CFString>?
-    var sz = UInt32(MemoryLayout<Unmanaged<CFString>?>.size)
-    guard AudioObjectGetPropertyData(id, &a, 0, nil, &sz, &str) == noErr, let v = str else { return nil }
-    return v.takeRetainedValue() as String
-}
+struct InputDevice: Hashable { let uid: String; let name: String }
 
 func listInputDevices() -> [InputDevice] {
-    var addr = AudioObjectPropertyAddress(mSelector: kAudioHardwarePropertyDevices, mScope: kAudioObjectPropertyScopeGlobal, mElement: kAudioObjectPropertyElementMain)
-    var size: UInt32 = 0
-    let sys = AudioObjectID(kAudioObjectSystemObject)
-    guard AudioObjectGetPropertyDataSize(sys, &addr, 0, nil, &size) == noErr else { return [] }
-    var ids = [AudioDeviceID](repeating: 0, count: Int(size) / MemoryLayout<AudioDeviceID>.size)
-    guard AudioObjectGetPropertyData(sys, &addr, 0, nil, &size, &ids) == noErr else { return [] }
-    return ids.compactMap { id in
-        var cfg = AudioObjectPropertyAddress(mSelector: kAudioDevicePropertyStreamConfiguration, mScope: kAudioDevicePropertyScopeInput, mElement: kAudioObjectPropertyElementMain)
-        var sz: UInt32 = 0
-        guard AudioObjectGetPropertyDataSize(id, &cfg, 0, nil, &sz) == noErr, sz > 0 else { return nil }
-        let buf = UnsafeMutableRawPointer.allocate(byteCount: Int(sz), alignment: 16)
-        defer { buf.deallocate() }
-        guard AudioObjectGetPropertyData(id, &cfg, 0, nil, &sz, buf) == noErr else { return nil }
-        let list = UnsafeMutableAudioBufferListPointer(buf.assumingMemoryBound(to: AudioBufferList.self))
-        guard list.reduce(0, { $0 + Int($1.mNumberChannels) }) > 0 else { return nil }
-        guard let uid = audioString(id, kAudioDevicePropertyDeviceUID), let name = audioString(id, kAudioObjectPropertyName) else { return nil }
-        return InputDevice(uid: uid, name: name, devID: id)
+    AVCaptureDevice.devices(for: .audio).map { InputDevice(uid: $0.uniqueID, name: $0.localizedName) }
+}
+
+/// Захват через AVCaptureSession: выбранный микрофон подключается напрямую, без побочных эффектов на вывод звука.
+final class AudioCapture: NSObject, AVCaptureAudioDataOutputSampleBufferDelegate {
+    private let session = AVCaptureSession()
+    private let queue = DispatchQueue(label: "shepot.audio")
+    var onBuffer: ((AVAudioPCMBuffer) -> Void)?
+
+    func start(uid: String) throws {
+        stop()
+        guard let dev = (uid.isEmpty ? nil : AVCaptureDevice(uniqueID: uid)) ?? AVCaptureDevice.default(for: .audio) else {
+            throw NSError(domain: "audio", code: 1, userInfo: [NSLocalizedDescriptionKey: "Микрофон не найден"])
+        }
+        let input = try AVCaptureDeviceInput(device: dev)
+        let out = AVCaptureAudioDataOutput()
+        out.setSampleBufferDelegate(self, queue: queue)
+        session.beginConfiguration()
+        guard session.canAddInput(input), session.canAddOutput(out) else {
+            session.commitConfiguration()
+            throw NSError(domain: "audio", code: 2, userInfo: [NSLocalizedDescriptionKey: "Не удалось подключить микрофон"])
+        }
+        session.addInput(input); session.addOutput(out)
+        session.commitConfiguration()
+        queue.async { [session] in session.startRunning() }
+    }
+
+    func stop() {
+        let s = session
+        queue.sync {
+            if s.isRunning { s.stopRunning() }
+            s.inputs.forEach { s.removeInput($0) }
+            s.outputs.forEach { s.removeOutput($0) }
+        }
+    }
+
+    func captureOutput(_ output: AVCaptureOutput, didOutput sb: CMSampleBuffer, from c: AVCaptureConnection) {
+        guard let fd = CMSampleBufferGetFormatDescription(sb),
+              let asbd = CMAudioFormatDescriptionGetStreamBasicDescription(fd),
+              let fmt = AVAudioFormat(streamDescription: asbd) else { return }
+        let n = CMSampleBufferGetNumSamples(sb)
+        guard n > 0, let pcm = AVAudioPCMBuffer(pcmFormat: fmt, frameCapacity: AVAudioFrameCount(n)) else { return }
+        pcm.frameLength = AVAudioFrameCount(n)
+        guard CMSampleBufferCopyPCMDataIntoAudioBufferList(sb, at: 0, frameCount: Int32(n), into: pcm.mutableAudioBufferList) == noErr else { return }
+        onBuffer?(pcm)
     }
 }
 
-func defaultInputDevice() -> InputDevice? {
-    var dev = AudioDeviceID(0); var size = UInt32(MemoryLayout<AudioDeviceID>.size)
-    var addr = AudioObjectPropertyAddress(mSelector: kAudioHardwarePropertyDefaultInputDevice, mScope: kAudioObjectPropertyScopeGlobal, mElement: kAudioObjectPropertyElementMain)
-    guard AudioObjectGetPropertyData(AudioObjectID(kAudioObjectSystemObject), &addr, 0, nil, &size, &dev) == noErr else { return nil }
-    return listInputDevices().first { $0.devID == dev }
+/// Приводит звук к 16 кГц моно float для Whisper и считает уровень 0…1.
+final class Resampler {
+    let outFmt = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: 16000, channels: 1, interleaved: false)!
+    private var conv: AVAudioConverter?
+    private var inFmt: AVAudioFormat?
+
+    func convert(_ buf: AVAudioPCMBuffer) -> (AVAudioPCMBuffer, Float)? {
+        if inFmt != buf.format { inFmt = buf.format; conv = AVAudioConverter(from: buf.format, to: outFmt) }
+        guard let conv = conv else { return nil }
+        let cap = AVAudioFrameCount(Double(buf.frameLength) * 16000 / buf.format.sampleRate) + 32
+        guard let out = AVAudioPCMBuffer(pcmFormat: outFmt, frameCapacity: cap) else { return nil }
+        var given = false
+        conv.convert(to: out, error: nil) { _, status in
+            if given { status.pointee = .noDataNow; return nil }
+            given = true; status.pointee = .haveData; return buf
+        }
+        var level: Float = 0
+        if let ch = out.floatChannelData?[0], out.frameLength > 0 {
+            var sum: Float = 0
+            for i in 0..<Int(out.frameLength) { sum += ch[i] * ch[i] }
+            let db = 20 * log10(max(sqrt(sum / Float(out.frameLength)), 1e-6))
+            level = max(0, min(1, (db + 50) / 38))
+        }
+        return (out, level)
+    }
 }
 
-/// Привязывает выбранный микрофон к входу движка (пустой uid — системный по умолчанию).
-func applyInputDevice(_ engine: AVAudioEngine, uid: String) {
-    guard !uid.isEmpty, let d = listInputDevices().first(where: { $0.uid == uid }), let au = engine.inputNode.audioUnit else { return }
-    var dev = d.devID
-    AudioUnitSetProperty(au, kAudioOutputUnitProperty_CurrentDevice, kAudioUnitScope_Global, 0, &dev, UInt32(MemoryLayout<AudioDeviceID>.size))
+func micAccessError() -> NSError? {
+    switch AVCaptureDevice.authorizationStatus(for: .audio) {
+    case .authorized: return nil
+    case .notDetermined:
+        AVCaptureDevice.requestAccess(for: .audio) { _ in }
+        return NSError(domain: "mic", code: 1, userInfo: [NSLocalizedDescriptionKey: "Разреши микрофон и повтори"])
+    default:
+        return NSError(domain: "mic", code: 2, userInfo: [NSLocalizedDescriptionKey: "Нет доступа к микрофону"])
+    }
 }
 
 /// Живой уровень микрофона в окне настроек.
 final class MicMeter: ObservableObject {
     static let shared = MicMeter()
     @Published var level: Double = 0
-    private var engine: AVAudioEngine?
+    private let cap = AudioCapture()
+    private let rs = Resampler()
 
     func start() {
         stop()
         guard Perm.mic.granted else { return }
-        let e = AVAudioEngine()
-        applyInputDevice(e, uid: Prefs.shared.micUID)
-        let fmt = e.inputNode.outputFormat(forBus: 0)
-        guard fmt.sampleRate > 0 else { return }
-        e.inputNode.installTap(onBus: 0, bufferSize: 1024, format: fmt) { [weak self] buf, _ in
-            guard let ch = buf.floatChannelData?[0], buf.frameLength > 0 else { return }
-            var sum: Float = 0
-            for i in 0..<Int(buf.frameLength) { sum += ch[i] * ch[i] }
-            let db = 20 * log10(max(sqrt(sum / Float(buf.frameLength)), 1e-6))
-            let v = Double(max(0, min(1, (db + 55) / 40)))
-            DispatchQueue.main.async { self?.level = max(v, (self?.level ?? 0) * 0.8) }
+        cap.onBuffer = { [weak self] buf in
+            guard let self = self, let (_, lv) = self.rs.convert(buf) else { return }
+            DispatchQueue.main.async { self.level = max(Double(lv), self.level * 0.8) }
         }
-        do { try e.start(); engine = e } catch { e.inputNode.removeTap(onBus: 0) }
+        try? cap.start(uid: Prefs.shared.micUID)
     }
 
-    func stop() {
-        engine?.inputNode.removeTap(onBus: 0)
-        engine?.stop(); engine = nil
-        level = 0
-    }
+    func stop() { cap.stop(); cap.onBuffer = nil; level = 0 }
 }
 
 // MARK: - Recorder (16 kHz mono WAV for whisper)
 
 final class Recorder {
-    private var engine = AVAudioEngine()
+    private let cap = AudioCapture()
+    private let rs = Resampler()
     private var file: AVAudioFile?
+    private(set) var frames = 0
     var onLevel: ((Float) -> Void)?
 
     func start(to url: URL) throws {
-        engine = AVAudioEngine()
-        applyInputDevice(engine, uid: Prefs.shared.micUID)
-        let input = engine.inputNode
-        let inFmt = input.outputFormat(forBus: 0)
-        let outFmt = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: 16000, channels: 1, interleaved: false)!
-        guard let conv = AVAudioConverter(from: inFmt, to: outFmt) else { throw NSError(domain: "rec", code: 1) }
-        let f = try AVAudioFile(forWriting: url, settings: [
+        if let e = micAccessError() { throw e }
+        frames = 0
+        file = try AVAudioFile(forWriting: url, settings: [
             AVFormatIDKey: kAudioFormatLinearPCM, AVSampleRateKey: 16000, AVNumberOfChannelsKey: 1,
             AVLinearPCMBitDepthKey: 16, AVLinearPCMIsFloatKey: false,
         ], commonFormat: .pcmFormatFloat32, interleaved: false)
-        file = f
-        input.installTap(onBus: 0, bufferSize: 1024, format: inFmt) { [weak self] buf, _ in
-            let cap = AVAudioFrameCount(Double(buf.frameLength) * 16000 / inFmt.sampleRate) + 32
-            guard let out = AVAudioPCMBuffer(pcmFormat: outFmt, frameCapacity: cap) else { return }
-            var given = false
-            conv.convert(to: out, error: nil) { _, status in
-                if given { status.pointee = .noDataNow; return nil }
-                given = true; status.pointee = .haveData; return buf
-            }
-            try? self?.file?.write(from: out)
-            if let ch = out.floatChannelData?[0], out.frameLength > 0 {
-                var sum: Float = 0
-                for i in 0..<Int(out.frameLength) { sum += ch[i] * ch[i] }
-                let rms = sqrt(sum / Float(out.frameLength))
-                let db = 20 * log10(max(rms, 1e-6))
-                self?.onLevel?(max(0, min(1, (db + 50) / 38)))
-            }
+        cap.onBuffer = { [weak self] buf in
+            guard let self = self, let (out, lv) = self.rs.convert(buf) else { return }
+            self.frames += Int(out.frameLength)
+            try? self.file?.write(from: out)
+            self.onLevel?(lv)
         }
-        engine.prepare()
-        try engine.start()
+        try cap.start(uid: Prefs.shared.micUID)
     }
 
     func stop() {
-        engine.inputNode.removeTap(onBus: 0)
-        engine.stop()
+        cap.stop()
+        cap.onBuffer = nil
         file = nil
     }
 }
@@ -759,6 +777,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
         NotificationCenter.default.addObserver(forName: .prefsChanged, object: nil, queue: .main) { [weak self] _ in self?.showPreview() }
         Whisper.migrateOldDir()
         let env0 = ProcessInfo.processInfo.environment
+        if env0["SHEPOT_MICTEST"] != nil {
+            print("devices:", listInputDevices().map { $0.name }, "auth:", AVCaptureDevice.authorizationStatus(for: .audio).rawValue)
+            if let u = env0["SHEPOT_MIC"] { Prefs.shared.micUID = listInputDevices().first { $0.name.contains(u) }?.uid ?? "" }
+            let url = FileManager.default.temporaryDirectory.appendingPathComponent("mictest.wav")
+            var maxLv: Float = 0
+            recorder.onLevel = { maxLv = max(maxLv, $0) }
+            do { try recorder.start(to: url) } catch { print("start error:", error.localizedDescription) }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 3) { print("frames:", self.recorder.frames, "maxLevel:", maxLv); self.recorder.stop(); exit(0) }
+            return
+        }
         if let path = env0["SHEPOT_PREVIEW_SHOT"] {
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { Prefs.shared.style = 1; Prefs.shared.opacity = 0.8 }
             DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in
@@ -825,13 +853,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
     }
 
     func defaultInputName() -> String {
-        var dev = AudioDeviceID(0); var size = UInt32(MemoryLayout<AudioDeviceID>.size)
-        var addr = AudioObjectPropertyAddress(mSelector: kAudioHardwarePropertyDefaultInputDevice, mScope: kAudioObjectPropertyScopeGlobal, mElement: kAudioObjectPropertyElementMain)
-        guard AudioObjectGetPropertyData(AudioObjectID(kAudioObjectSystemObject), &addr, 0, nil, &size, &dev) == noErr, dev != 0 else { return "НЕТ микрофона по умолчанию" }
-        var name: CFString = "" as CFString; var nsize = UInt32(MemoryLayout<CFString>.size)
-        var naddr = AudioObjectPropertyAddress(mSelector: kAudioDevicePropertyDeviceNameCFString, mScope: kAudioObjectPropertyScopeGlobal, mElement: kAudioObjectPropertyElementMain)
-        _ = withUnsafeMutablePointer(to: &name) { AudioObjectGetPropertyData(dev, &naddr, 0, nil, &nsize, $0) }
-        return name as String
+        AVCaptureDevice.default(for: .audio)?.localizedName ?? "НЕТ микрофона по умолчанию"
     }
 
     @objc func copyDiagnostics() {
@@ -1079,6 +1101,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
         statusItem.button?.image = NSImage(systemSymbolName: "record.circle.fill", accessibilityDescription: nil)
         NSSound(named: "Tink")?.play()
         rebuildMenu()
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) { [weak self] in
+            guard let self = self, self.recording, self.recorder.frames == 0 else { return }
+            self.log("нет данных с микрофона за 2 с")
+            self.recording = false; self.recorder.stop()
+            self.flash("Микрофон не передаёт звук. Выбери другой в настройках")
+        }
     }
 
     func stopRecording() {
