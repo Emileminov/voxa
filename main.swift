@@ -29,7 +29,7 @@ func listInputDevices() -> [InputDevice] {
 /// Захват через AVCaptureSession: выбранный микрофон подключается напрямую, без побочных эффектов на вывод звука.
 final class AudioCapture: NSObject, AVCaptureAudioDataOutputSampleBufferDelegate {
     private let session = AVCaptureSession()
-    private let queue = DispatchQueue(label: "shepot.audio")
+    private let queue = DispatchQueue(label: "voxa.audio")
     var onBuffer: ((AVAudioPCMBuffer) -> Void)?
     private(set) var ok = 0, failed = 0
     private(set) var lastFormat = "—"
@@ -195,10 +195,14 @@ enum Whisper {
     /// Переезд моделей из старой папки «Диктовка» (чтобы не скачивать 1,6 ГБ заново)
     static func migrateOldDir() {
         let fm = FileManager.default
-        let old = fm.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support/Диктовка")
-        if fm.fileExists(atPath: old.path) && !fm.fileExists(atPath: dir.path) { try? fm.moveItem(at: old, to: dir) }
+        let base = fm.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support")
+        guard !fm.fileExists(atPath: dir.path) else { return }
+        for old in ["Шёпот", "Диктовка"] {
+            let u = base.appendingPathComponent(old)
+            if fm.fileExists(atPath: u.path) { try? fm.moveItem(at: u, to: dir); return }
+        }
     }
-    static let dir = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support/Шёпот")
+    static let dir = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support/Voxa")
     static let turbo = dir.appendingPathComponent("ggml-large-v3-turbo.bin")
     static let turboURL = URL(string: "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3-turbo.bin")!
     static var model: String? {
@@ -785,7 +789,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
     var statusItem: NSStatusItem!
     var recording = false
     var startTime = Date()
-    var wavURL = FileManager.default.temporaryDirectory.appendingPathComponent("shepot.wav")
+    var wavURL = FileManager.default.temporaryDirectory.appendingPathComponent("voxa.wav")
     var lang: String { UserDefaults.standard.string(forKey: "lang") ?? "auto" }
     var targetApp: NSRunningApplication?
 
@@ -798,9 +802,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
         NotificationCenter.default.addObserver(forName: .prefsChanged, object: nil, queue: .main) { [weak self] _ in self?.showPreview() }
         Whisper.migrateOldDir()
         let env0 = ProcessInfo.processInfo.environment
-        if env0["SHEPOT_MICTEST"] != nil {
+        if env0["VOXA_MICTEST"] != nil {
             print("devices:", listInputDevices().map { $0.name }, "auth:", AVCaptureDevice.authorizationStatus(for: .audio).rawValue)
-            if let u = env0["SHEPOT_MIC"] { Prefs.shared.micUID = listInputDevices().first { $0.name.contains(u) }?.uid ?? "" }
+            if let u = env0["VOXA_MIC"] { Prefs.shared.micUID = listInputDevices().first { $0.name.contains(u) }?.uid ?? "" }
             let url = FileManager.default.temporaryDirectory.appendingPathComponent("mictest.wav")
             var maxLv: Float = 0
             recorder.onLevel = { maxLv = max(maxLv, $0) }
@@ -808,7 +812,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
             DispatchQueue.main.asyncAfter(deadline: .now() + 3) { print("frames:", self.recorder.frames, "maxLevel:", maxLv); self.recorder.stop(); exit(0) }
             return
         }
-        if let path = env0["SHEPOT_PREVIEW_SHOT"] {
+        if let path = env0["VOXA_PREVIEW_SHOT"] {
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { Prefs.shared.style = 1; Prefs.shared.opacity = 0.8 }
             DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in
                 guard let self = self else { exit(1) }
@@ -821,7 +825,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
             }
             return
         }
-        if let path = env0["SHEPOT_SETTINGS_SHOT"] {
+        if let path = env0["VOXA_SETTINGS_SHOT"] {
             DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
                 let r = ImageRenderer(content: SettingsView().background(Color(white: 0.16)).environment(\.colorScheme, .dark))
                 r.scale = 2
@@ -830,7 +834,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
             }
             return
         }
-        if let d = env0["SHEPOT_DEMO"] { runDemo(d); return }
+        if let d = env0["VOXA_DEMO"] { runDemo(d); return }
         if Whisper.model == nil { downloadModel() }
 
         // Hold Right Option to talk
@@ -879,7 +883,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
 
     @objc func copyDiagnostics() {
         let info = Bundle.main.infoDictionary
-        var out = ["Шёпот \(info?["CFBundleShortVersionString"] ?? "?") (\(info?["CFBundleVersion"] ?? "?"))",
+        var out = ["Voxa \(info?["CFBundleShortVersionString"] ?? "?") (\(info?["CFBundleVersion"] ?? "?"))",
                    "macOS \(ProcessInfo.processInfo.operatingSystemVersionString), \(ProcessInfo.processInfo.machineHardwareName)",
                    "Микрофон по умолчанию: \(defaultInputName())",
                    "Разрешения: микрофон=\(Perm.mic.granted) доступ=\(Perm.access.granted) мониторинг=\(Perm.input.granted)",
@@ -964,19 +968,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
         d.start()
     }
 
-    /// Режим для проверки внешнего вида: SHEPOT_DEMO=recording|transcribing|done, SHEPOT_STYLE, SHEPOT_POS
+    /// Режим для проверки внешнего вида: VOXA_DEMO=recording|transcribing|done, VOXA_STYLE, VOXA_POS
     func runDemo(_ phase: String) {
         let env = ProcessInfo.processInfo.environment
-        if let v = env["SHEPOT_STYLE"], let i = Int(v) { Prefs.shared.style = i }
-        if let v = env["SHEPOT_POS"], let i = Int(v) { Prefs.shared.position = i }
-        if let v = env["SHEPOT_SCALE"], let d = Double(v) { Prefs.shared.scale = d }
+        if let v = env["VOXA_STYLE"], let i = Int(v) { Prefs.shared.style = i }
+        if let v = env["VOXA_POS"], let i = Int(v) { Prefs.shared.position = i }
+        if let v = env["VOXA_SCALE"], let d = Double(v) { Prefs.shared.scale = d }
         model.phase = phase == "transcribing" ? .transcribing : (phase == "done" ? .done : .recording)
         showPanel()
         let t0 = Date()
-        if let path = env["SHEPOT_SHOT"] {
+        if let path = env["VOXA_SHOT"] {
             DispatchQueue.main.asyncAfter(deadline: .now() + 1.8) { [weak self] in
                 guard let self = self else { exit(1) }
-                let bg = Double(env["SHEPOT_BG"] ?? "0.45") ?? 0.45
+                let bg = Double(env["VOXA_BG"] ?? "0.45") ?? 0.45
                 let r = ImageRenderer(content: ZStack { Color(white: bg); OverlayView(m: self.model) }.frame(width: panelW, height: panelH))
                 r.scale = 2
                 if let img = r.nsImage, let tiff = img.tiffRepresentation, let png = NSBitmapImageRep(data: tiff)?.representation(using: .png, properties: [:]) {
@@ -1040,7 +1044,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
 
     func setupMenu() {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
-        statusItem.button?.image = NSImage(systemSymbolName: "waveform.circle.fill", accessibilityDescription: "Шёпот")
+        statusItem.button?.image = NSImage(systemSymbolName: "waveform.circle.fill", accessibilityDescription: "Voxa")
         rebuildMenu()
     }
 
@@ -1094,7 +1098,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
     @objc func openSettings() {
         if settingsWindow == nil {
             let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 710, height: 370), styleMask: [.titled, .closable], backing: .buffered, defer: false)
-            w.title = "Шёпот — настройки"
+            w.title = "Voxa — настройки"
             w.isReleasedWhenClosed = false
             w.delegate = self
             let host = NSHostingView(rootView: SettingsView())
