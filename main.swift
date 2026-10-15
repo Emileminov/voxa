@@ -2,6 +2,7 @@ import Cocoa
 import SwiftUI
 import AVFoundation
 import Combine
+import ServiceManagement
 
 // MARK: - Model
 
@@ -122,14 +123,19 @@ enum Whisper {
     }
 }
 
+extension Notification.Name { static let positionChanged = Notification.Name("positionChanged") }
+let panelW: CGFloat = 720, panelH: CGFloat = 340
+
 // MARK: - Prefs
 
 final class Prefs: ObservableObject {
     static let shared = Prefs()
     @Published var style: Int { didSet { UserDefaults.standard.set(style, forKey: "style") } }
     @Published var opacity: Double { didSet { UserDefaults.standard.set(opacity, forKey: "opacity") } }
+    @Published var position: Int { didSet { UserDefaults.standard.set(position, forKey: "position"); NotificationCenter.default.post(name: .positionChanged, object: nil) } }
     @Published var scale: Double { didSet { UserDefaults.standard.set(scale, forKey: "scale") } }
     init() {
+        position = UserDefaults.standard.object(forKey: "position") as? Int ?? 7
         let sc = UserDefaults.standard.double(forKey: "scale")
         scale = sc == 0 ? 1 : sc
         style = UserDefaults.standard.integer(forKey: "style")
@@ -415,14 +421,18 @@ struct OverlayView: View {
     @ObservedObject var m: Model
     @ObservedObject var prefs = Prefs.shared
     var body: some View {
+        let col = prefs.position % 3, row = prefs.position / 3
+        let hs: [HorizontalAlignment] = [.leading, .center, .trailing]
+        let vs: [VerticalAlignment] = [.top, .center, .bottom]
+        let anchor = UnitPoint(x: [0, 0.5, 1][col], y: [0, 0.5, 1][row])
         Visual(m: m, style: prefs.style)
             .opacity(m.visible ? prefs.opacity : 0)
-            .scaleEffect(m.visible ? CGFloat(prefs.scale) : 0.5 * CGFloat(prefs.scale), anchor: .bottom)
-            .offset(y: m.visible ? 0 : 20)
+            .scaleEffect(m.visible ? CGFloat(prefs.scale) : 0.5 * CGFloat(prefs.scale), anchor: anchor)
+            .offset(y: m.visible ? 0 : (row == 0 ? -20 : 20))
             .animation(.spring(response: 0.45, dampingFraction: 0.65), value: m.visible)
             .animation(.easeInOut(duration: 0.3), value: m.phase)
-            .padding(.bottom, 44)
-            .frame(width: 640, height: 300, alignment: .bottom)
+            .padding(44)
+            .frame(width: panelW, height: panelH, alignment: Alignment(horizontal: hs[col], vertical: vs[row]))
     }
 }
 
@@ -449,6 +459,29 @@ struct SettingsView: View {
     @ObservedObject var prefs = Prefs.shared
     @StateObject var demo = Demo()
     @AppStorage("lang") var lang = "auto"
+    @State var launchAtLogin = SMAppService.mainApp.status == .enabled
+
+    var positionGrid: some View {
+        ZStack {
+            RoundedRectangle(cornerRadius: 8).fill(Color(white: 0.12))
+            VStack(spacing: 6) {
+                ForEach(0..<3, id: \.self) { r in
+                    HStack(spacing: 6) {
+                        ForEach(0..<3, id: \.self) { c in
+                            let i = r * 3 + c
+                            RoundedRectangle(cornerRadius: 4)
+                                .fill(prefs.position == i ? Color.accentColor : Color.white.opacity(0.14))
+                                .frame(width: 34, height: 20)
+                                .onTapGesture { prefs.position = i }
+                        }
+                    }
+                }
+            }
+        }
+        .frame(width: 142, height: 98)
+        .overlay(RoundedRectangle(cornerRadius: 8).strokeBorder(Color.gray.opacity(0.4), lineWidth: 1))
+    }
+
     let names = ["Шар в капсуле", "Волны Siri", "Эквалайзер", "Шар Siri"]
 
     func card(_ i: Int) -> some View {
@@ -484,12 +517,23 @@ struct SettingsView: View {
                 Slider(value: $prefs.scale, in: 0.5...1.4)
                 Text("\(Int(prefs.scale * 100))%").monospacedDigit().frame(width: 44, alignment: .trailing)
             }
+            HStack(alignment: .top, spacing: 12) {
+                Text("Положение").frame(width: 110, alignment: .leading)
+                positionGrid
+                Spacer()
+            }
             HStack(spacing: 12) {
                 Text("Язык").frame(width: 110, alignment: .leading)
                 Picker("", selection: $lang) {
                     Text("Авто").tag("auto"); Text("Русский").tag("ru"); Text("English").tag("en")
                 }.pickerStyle(.segmented).labelsHidden()
             }
+            Toggle("Запускать при входе в систему", isOn: Binding(
+                get: { launchAtLogin },
+                set: { v in
+                    do { if v { try SMAppService.mainApp.register() } else { try SMAppService.mainApp.unregister() } } catch {}
+                    launchAtLogin = SMAppService.mainApp.status == .enabled
+                }))
             Text("Зажми правый ⌥ и говори").font(.footnote).foregroundColor(.secondary)
         }
         .padding(22)
@@ -541,6 +585,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let opts = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary
         _ = AXIsProcessTrustedWithOptions(opts)
 
+        NotificationCenter.default.addObserver(forName: .positionChanged, object: nil, queue: .main) { [weak self] _ in
+            guard let self = self, self.model.phase == .idle || self.model.phase == .done else { return }
+            self.model.phase = .done
+            self.showPanel()
+            self.hidePanel(after: 1.4)
+        }
         if Whisper.model == nil { downloadModel() }
 
         // Hold Right Option to talk
@@ -589,7 +639,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func setupPanel() {
-        panel = NSPanel(contentRect: NSRect(x: 0, y: 0, width: 640, height: 300),
+        panel = NSPanel(contentRect: NSRect(x: 0, y: 0, width: panelW, height: panelH),
                         styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
         panel.level = .statusBar
         panel.isOpaque = false
@@ -605,7 +655,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func showPanel() {
         if let s = NSScreen.main {
             let f = s.visibleFrame
-            panel.setFrameOrigin(NSPoint(x: f.midX - 320, y: f.minY - 38))
+            let pos = Prefs.shared.position, col = pos % 3, row = pos / 3
+            let inset: CGFloat = 38   // 44 внутренний отступ - 6 от края экрана
+            let x = [f.minX - inset, f.midX - panelW / 2, f.maxX - panelW + inset][col]
+            let y = [f.maxY - panelH + inset, f.midY - panelH / 2, f.minY - inset][row]
+            panel.setFrameOrigin(NSPoint(x: x, y: y))
         }
         panel.orderFrontRegardless()
         DispatchQueue.main.async { self.model.visible = true }
@@ -648,7 +702,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 710, height: 370), styleMask: [.titled, .closable], backing: .buffered, defer: false)
             w.title = "Диктовка — настройки"
             w.isReleasedWhenClosed = false
-            w.contentView = NSHostingView(rootView: SettingsView())
+            let host = NSHostingView(rootView: SettingsView())
+            w.contentView = host
+            w.setContentSize(host.fittingSize)
             w.center()
             settingsWindow = w
         }
