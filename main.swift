@@ -693,9 +693,8 @@ struct SettingsView: View {
             }
             .onReceive(Timer.publish(every: 2, on: .main, in: .common).autoconnect()) { _ in
                 let d = listInputDevices(); if d != devices { devices = d }
-                if meter.level == 0 && Perm.mic.granted { meter.start() }
             }
-            .onAppear { devices = listInputDevices(); meter.start() }
+            .onAppear { devices = listInputDevices() }
             HStack(spacing: 12) {
                 Text("Язык").frame(width: 110, alignment: .leading)
                 Picker("", selection: $lang) {
@@ -1067,6 +1066,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
 
     var settingsWindow: NSWindow?
     func windowWillClose(_ n: Notification) { MicMeter.shared.stop() }
+    func windowDidResignKey(_ n: Notification) { MicMeter.shared.stop() }   // микрофон включён только пока окно настроек активно
+    func windowDidBecomeKey(_ n: Notification) { MicMeter.shared.start() }
 
     @objc func openSettings() {
         if settingsWindow == nil {
@@ -1082,7 +1083,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
         }
         NSApp.activate(ignoringOtherApps: true)
         settingsWindow?.makeKeyAndOrderFront(nil)
-        MicMeter.shared.start()
     }
     @objc func toggle() { if recording { stopRecording() } else { viaMenu = true; startRecording() } }
 
