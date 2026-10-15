@@ -678,6 +678,7 @@ struct SettingsView: View {
     }
 
     var body: some View {
+        ScrollView(.vertical, showsIndicators: true) {
         VStack(alignment: .leading, spacing: 18) {
             Text("Вид анимации").font(.headline)
             HStack(spacing: 14) { ForEach(0..<4, id: \.self) { card($0) } }
@@ -756,6 +757,7 @@ struct SettingsView: View {
         }
         .padding(22)
         .frame(width: 710)
+        }
     }
 }
 
@@ -805,6 +807,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
         NotificationCenter.default.addObserver(forName: .prefsChanged, object: nil, queue: .main) { [weak self] _ in self?.showPreview() }
         Whisper.migrateOldDir()
         let env0 = ProcessInfo.processInfo.environment
+        if env0["VOXA_WINDOWTEST"] != nil {
+            openSettings()
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in
+                guard let w = self?.settingsWindow, let host = w.contentView as? NSHostingView<SettingsView> else { exit(1) }
+                print("window content:", w.contentView!.frame.size, "window frame:", w.frame.size, "screen:", NSScreen.main!.visibleFrame.size)
+                exit(0)
+            }
+            return
+        }
         if env0["VOXA_MICTEST"] != nil {
             print("devices:", listInputDevices().map { $0.name }, "auth:", AVCaptureDevice.authorizationStatus(for: .audio).rawValue)
             if let u = env0["VOXA_MIC"] { Prefs.shared.micUID = listInputDevices().first { $0.name.contains(u) }?.uid ?? "" }
@@ -830,7 +841,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
         }
         if let path = env0["VOXA_SETTINGS_SHOT"] {
             DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
-                let r = ImageRenderer(content: SettingsView().background(Color(white: 0.16)).environment(\.colorScheme, .dark))
+                let r = ImageRenderer(content: SettingsView().frame(width: 710, height: 720).background(Color(white: 0.16)).environment(\.colorScheme, .dark))
                 r.scale = 2
                 if let t = r.nsImage?.tiffRepresentation, let png = NSBitmapImageRep(data: t)?.representation(using: .png, properties: [:]) { try? png.write(to: URL(fileURLWithPath: path)) }
                 exit(0)
@@ -1100,13 +1111,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
 
     @objc func openSettings() {
         if settingsWindow == nil {
-            let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 710, height: 370), styleMask: [.titled, .closable], backing: .buffered, defer: false)
+            let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 710, height: 370), styleMask: [.titled, .closable, .resizable], backing: .buffered, defer: false)
             w.title = "Voxa — настройки"
             w.isReleasedWhenClosed = false
             w.delegate = self
             let host = NSHostingView(rootView: SettingsView())
             w.contentView = host
-            w.setContentSize(host.fittingSize)
+            let maxH = (NSScreen.main?.visibleFrame.height ?? 800) - 70   // чтобы окно целиком влезало в экран
+            w.setContentSize(NSSize(width: 710, height: min(710, maxH)))
+            w.minSize = NSSize(width: 710, height: 360)
             w.center()
             settingsWindow = w
         }
