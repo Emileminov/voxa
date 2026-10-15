@@ -255,6 +255,11 @@ enum Whisper {
     }
 }
 
+let appVersion: String = {
+    let i = Bundle.main.infoDictionary
+    return "\(i?["CFBundleShortVersionString"] ?? "?") (\(i?["CFBundleVersion"] ?? "?"))"
+}()
+
 extension Notification.Name { static let prefsChanged = Notification.Name("prefsChanged") }
 let panelW: CGFloat = 720, panelH: CGFloat = 340
 
@@ -753,7 +758,7 @@ struct SettingsView: View {
                     do { if v { try SMAppService.mainApp.register() } else { try SMAppService.mainApp.unregister() } } catch {}
                     launchAtLogin = SMAppService.mainApp.status == .enabled
                 }))
-            Text("Зажми правый ⌥ и говори, или нажми ⌃⌥Пробел (старт/стоп)").font(.footnote).foregroundColor(.secondary)
+            Text("Зажми правый ⌥ и говори, или нажми ⌃⌥Пробел (старт/стоп)  ·  Версия \(appVersion)").font(.footnote).foregroundColor(.secondary)
         }
         .padding(22)
         .frame(width: 710)
@@ -1064,6 +1069,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWind
 
     func rebuildMenu() {
         let menu = NSMenu()
+        let ver = NSMenuItem(title: "Voxa \(appVersion)", action: nil, keyEquivalent: "")
+        ver.isEnabled = false
+        menu.addItem(ver)
         let hint = NSMenuItem(title: "Зажми правый ⌥ или нажми ⌃⌥Пробел", action: nil, keyEquivalent: "")
         hint.isEnabled = false
         menu.addItem(hint)
